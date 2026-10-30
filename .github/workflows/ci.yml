@@ -84,7 +84,6 @@ jobs:
 
   csharp:
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('csharp/**/*.csproj') != '' }}
     defaults:
       run:
         working-directory: csharp
@@ -94,3 +93,4 @@ jobs:
         with:
           dotnet-version: 8.0.x
       - run: dotnet build
+        if: ${{ hashFiles('csharp/**/*.csproj') != '' }}
