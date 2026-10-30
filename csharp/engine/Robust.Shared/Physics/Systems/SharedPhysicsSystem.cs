@@ -58,6 +58,8 @@ namespace Robust.Shared.Physics.Systems
 
         private int _substeps;
 
+        internal IConfigurationManager Cfg => _cfg;
+
         private IPhysicsBackend? _backend;
 
         public string? PhysicsBackendName => _backend?.Name;
@@ -189,6 +191,12 @@ namespace Robust.Shared.Physics.Systems
             where TEvent : struct
         {
             RaiseLocalEvent(uid, ref args, broadcast);
+        }
+
+        internal void BackendRaiseBroadcast<TEvent>(ref TEvent args)
+            where TEvent : struct
+        {
+            RaiseLocalEvent(ref args);
         }
 
         internal bool BackendWriteVelocities(EntityUid uid, PhysicsComponent body, Vector2 linear, float angular)

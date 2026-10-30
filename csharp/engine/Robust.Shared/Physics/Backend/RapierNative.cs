@@ -8,7 +8,7 @@ namespace Robust.Shared.Physics.Backend;
 
 internal static class RapierNative
 {
-    public const uint AbiVersion = 1;
+    public const uint AbiVersion = 2;
 
     public const uint OpAddBody = 1;
     public const uint OpRemoveBody = 2;
@@ -24,10 +24,23 @@ internal static class RapierNative
     public const uint OpSetAwake = 12;
     public const uint OpSetGravity = 13;
     public const uint OpSetForce = 14;
+    public const uint OpAddJoint = 15;
+    public const uint OpRemoveJoint = 16;
+    public const uint OpSetSleep = 17;
+    public const uint OpSetJointParams = 18;
 
     public const ulong KindDynamic = 0;
     public const ulong KindStatic = 1;
     public const ulong KindKinematic = 2;
+
+    public const uint JointDistanceRigid = 0;
+    public const uint JointDistanceSpring = 1;
+    public const uint JointRevolute = 2;
+    public const uint JointPrismatic = 3;
+    public const uint JointWeld = 4;
+
+    public const float JointLimitEnabled = 1f;
+    public const float JointMotorEnabled = 2f;
 
     public const uint FlagAsleep = 1;
 
@@ -81,6 +94,18 @@ internal static class RapierNative
         public float P1x;
         public float P1y;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct SgJointEvent
+    {
+        public ulong Id;
+        public float Impulse;
+        public uint Reserved;
+        public uint Reserved2;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate uint PairFilterCallback(IntPtr ctx, ulong a, ulong b);
 
     public static void EnsureLoaded()
     {
@@ -140,6 +165,12 @@ internal static class RapierNative
     internal static extern void sg_world_destroy(IntPtr world);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void sg_world_set_pair_filter(IntPtr world, PairFilterCallback? filter, IntPtr ctx);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void sg_world_set_sleep(IntPtr world, float timeUntilSleep, float linearThreshold, float angularThreshold);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static unsafe extern uint sg_world_set_vertices(IntPtr world, float* data, UIntPtr count);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
@@ -159,4 +190,10 @@ internal static class RapierNative
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static unsafe extern UIntPtr sg_world_copy_events(IntPtr world, SgContactEvent* events, UIntPtr capacity);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern UIntPtr sg_world_joint_event_count(IntPtr world);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static unsafe extern UIntPtr sg_world_copy_joint_events(IntPtr world, SgJointEvent* events, UIntPtr capacity);
 }

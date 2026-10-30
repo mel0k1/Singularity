@@ -6,6 +6,7 @@ using Robust.Shared.Physics;
 using Robust.Shared.Physics.Backend;
 using Robust.Shared.Physics.Collision.Shapes;
 using Robust.Shared.Physics.Components;
+using Robust.Shared.Physics.Dynamics.Joints;
 using Robust.Shared.Physics.Events;
 using Robust.Shared.Physics.Systems;
 using Robust.UnitTesting.Server;
@@ -18,6 +19,9 @@ public enum SceneKind
     Floor,
     Rain,
     Mover,
+    Chain,
+    Welds,
+    Prevent,
 }
 
 public sealed record FfiStats(
@@ -25,11 +29,20 @@ public sealed record FfiStats(
     double StepMicros,
     double StatesMicros,
     double EventsMicros,
+    double OrchestrationMicros,
     long ApplyCalls,
     long StepCalls,
     long Commands,
     long StatesCopied,
     long EventsCopied,
+    long PairFilterCalls,
+    long JointsSeen,
+    long JointCommands,
+    long JointBreaks,
+    long DirtySyncs,
+    long AuditTicks,
+    long AuditMisses,
+    long FullSyncTicks,
     long[] OpCounts);
 
 public sealed record Outcome(
@@ -48,6 +61,9 @@ public sealed record Outcome(
     int Gen0,
     int Gen1,
     int Gen2,
+    int Joints,
+    float WeldDrift,
+    long PreventCalls,
     FfiStats? Ffi);
 
 public static class Scenes
@@ -55,6 +71,10 @@ public static class Scenes
     public const float Dt = 1f / 60f;
     public const int RainSpawns = 300;
     public const float MoverSpeed = 1.5f;
+    public const int ChainLinks = 12;
+    public const int RopeBeads = 6;
+    public const int WeldPairs = 16;
+    public const int PreventDiscs = 40;
 
     public static string Name(SceneKind scene)
     {
@@ -64,6 +84,9 @@ public static class Scenes
             SceneKind.Floor => "floor",
             SceneKind.Rain => "rain",
             SceneKind.Mover => "mover",
+            SceneKind.Chain => "chain",
+            SceneKind.Welds => "welds",
+            SceneKind.Prevent => "prevent",
             _ => throw new ArgumentOutOfRangeException(nameof(scene)),
         };
     }
@@ -76,6 +99,9 @@ public static class Scenes
             case "floor": scene = SceneKind.Floor; return true;
             case "rain": scene = SceneKind.Rain; return true;
             case "mover": scene = SceneKind.Mover; return true;
+            case "chain": scene = SceneKind.Chain; return true;
+            case "welds": scene = SceneKind.Welds; return true;
+            case "prevent": scene = SceneKind.Prevent; return true;
             default: scene = SceneKind.Idle; return false;
         }
     }
@@ -86,6 +112,9 @@ public static class Scenes
         {
             SceneKind.Rain => 2022,
             SceneKind.Mover => 3033,
+            SceneKind.Chain => 4044,
+            SceneKind.Welds => 5055,
+            SceneKind.Prevent => 6066,
             _ => 1011,
         };
     }
@@ -98,7 +127,11 @@ public static class Scenes
                 cfg.SetCVar("physics.target_minimum_tickrate", 30);
                 cfg.SetCVar("physics.backend", backend);
             })
-            .RegisterEntitySystems(factory => factory.LoadExtraSystemType<ContactCounterSystem>())
+            .RegisterEntitySystems(factory =>
+            {
+                factory.LoadExtraSystemType<ContactCounterSystem>();
+                factory.LoadExtraSystemType<PreventCollideCancellerSystem>();
+            })
             .InitializeInstance();
         var ent = sim.Resolve<IEntityManager>();
         var physics = ent.System<SharedPhysicsSystem>();
@@ -106,17 +139,23 @@ public static class Scenes
         if (backend != "farseer" && activeBackend != backend)
             throw new InvalidOperationException($"physics backend '{backend}' did not activate (native library missing?)");
         var fixtures = ent.System<FixtureSystem>();
+        var joints = ent.System<SharedJointSystem>();
+        var transform = ent.System<SharedTransformSystem>();
         var mapSys = ent.System<SharedMapSystem>();
         mapSys.CreateMap(out var mapId);
         physics.SetGravity(new Vector2(0f, -9.81f));
         ContactCounterSystem.Starts = 0;
+        PreventCollideCancellerSystem.Calls = 0;
+        PreventCollideCancellerSystem.Enabled = scene == SceneKind.Prevent;
         RapierPhysicsMetrics.Reset();
 
         var rng = new Rng((ulong)Seed(scene));
         var ids = new List<EntityUid>();
         var dyn = new List<EntityUid>();
         var cargo = new List<(EntityUid Uid, float X0)>();
-        EntityUid platform;
+        var chainBodies = new List<EntityUid>();
+        var weldPairs = new List<(EntityUid A, EntityUid B)>();
+        EntityUid platform = default;
 
         if (scene is SceneKind.Floor or SceneKind.Idle)
         {
@@ -154,6 +193,82 @@ public static class Scenes
             ids.Add(platform);
             ids.Add(AddWall(ent, physics, fixtures, mapId, -8.75f));
             ids.Add(AddWall(ent, physics, fixtures, mapId, 8.75f));
+        }
+        else if (scene == SceneKind.Chain)
+        {
+            var anchor = AddBox(ent, physics, fixtures, mapId, new Vector2(0f, 20f), 0.5f, 0.9f);
+            physics.SetBodyType(anchor, BodyType.Static, body: ent.GetComponent<PhysicsComponent>(anchor));
+            ids.Add(anchor);
+            EntityUid previous = anchor;
+            for (var i = 0; i < ChainLinks; i++)
+            {
+                var uid = AddBox(ent, physics, fixtures, mapId, new Vector2(0f, 19f - i * 0.95f), 0.45f, 0.8f);
+                ids.Add(uid);
+                dyn.Add(uid);
+                chainBodies.Add(uid);
+                var joint = joints.CreateRevoluteJoint(previous, uid, id: $"chain{i}");
+                joint.LocalAnchorA = new Vector2(0f, i == 0 ? -0.5f : -0.475f);
+                joint.LocalAnchorB = new Vector2(0f, 0.475f);
+                joint.CollideConnected = false;
+                previous = uid;
+            }
+
+            for (var i = 0; i < RopeBeads; i++)
+            {
+                var x = 3f;
+                var y = 19.5f - i * 0.6f;
+                var uid = AddDisc(ent, physics, fixtures, mapId, new Vector2(x, y), 0.28f, 0.6f);
+                ids.Add(uid);
+                dyn.Add(uid);
+                chainBodies.Add(uid);
+                if (i == 0)
+                {
+                    var rope = joints.CreateDistanceJoint(anchor, uid, id: $"rope{i}");
+                    rope.CollideConnected = false;
+                }
+                else
+                {
+                    var prev = ids[^2];
+                    var rope = joints.CreateDistanceJoint(prev, uid, id: $"rope{i}");
+                    rope.CollideConnected = false;
+                }
+            }
+        }
+        else if (scene == SceneKind.Welds)
+        {
+            platform = AddPlatform(ent, physics, fixtures, mapId, 40, 4, 0f, BodyType.Static);
+            ids.Add(platform);
+            for (var p = 0; p < WeldPairs; p++)
+            {
+                var x = (p - WeldPairs * 0.5f + 0.5f) * 2.2f;
+                var y = 1.6f + (p % 4) * 1.3f;
+                var a = AddBox(ent, physics, fixtures, mapId, new Vector2(x, y), 0.45f, 0.8f);
+                var b = AddBox(ent, physics, fixtures, mapId, new Vector2(x + 0.95f, y), 0.45f, 0.8f);
+                transform.SetWorldRotation(b, MathF.PI / 2f);
+                ids.Add(a);
+                ids.Add(b);
+                dyn.Add(a);
+                dyn.Add(b);
+                var weld = joints.CreateWeldJoint(a, b, id: $"weld{p}");
+                weld.LocalAnchorA = new Vector2(0.475f, 0f);
+                weld.LocalAnchorB = new Vector2(0f, 0.475f);
+                weld.ReferenceAngle = MathF.PI / 2f;
+                weld.CollideConnected = false;
+                weldPairs.Add((a, b));
+            }
+        }
+        else if (scene == SceneKind.Prevent)
+        {
+            platform = AddPlatform(ent, physics, fixtures, mapId, 16, 4, 0f, BodyType.Static);
+            ids.Add(platform);
+            for (var d = 0; d < PreventDiscs; d++)
+            {
+                var x = rng.NextF32(-6f, 6f);
+                var y = 3f + d * 0.9f;
+                var uid = AddDisc(ent, physics, fixtures, mapId, new Vector2(x, y), 0.35f, 0.6f);
+                ids.Add(uid);
+                dyn.Add(uid);
+            }
         }
         else
         {
@@ -237,6 +352,19 @@ public static class Scenes
         }
         if (dyn.Count == 0) minY = 0f;
 
+        if (Environment.GetEnvironmentVariable("SINGULARITY_BENCH_DUMP") == "1")
+        {
+            foreach (var id in dyn)
+            {
+                var pos = ent.GetComponent<TransformComponent>(id).WorldPosition;
+                if (pos.Y < -1f)
+                {
+                    var dumpedJoints = ent.TryGetComponent<JointComponent>(id, out var jc) ? jc.JointCount : 0;
+                    Console.WriteLine($"  dump {id} at {pos.X:F2},{pos.Y:F2} joints {dumpedJoints}");
+                }
+            }
+        }
+
         var cargoDx = 0f;
         if (cargo.Count > 0)
         {
@@ -248,6 +376,28 @@ public static class Scenes
             cargoDx = sum / cargo.Count;
         }
 
+        var jointCount = 0;
+        foreach (var id in ids)
+        {
+            if (ent.TryGetComponent<JointComponent>(id, out var jointComponent))
+                jointCount += jointComponent.JointCount;
+        }
+        jointCount /= 2;
+
+        var weldDrift = 0f;
+        if (weldPairs.Count > 0)
+        {
+            var sum = 0f;
+            foreach (var (a, b) in weldPairs)
+            {
+                var angleA = ent.GetComponent<TransformComponent>(a).WorldRotation.Theta;
+                var angleB = ent.GetComponent<TransformComponent>(b).WorldRotation.Theta;
+                var relative = (float)(angleB - angleA);
+                sum += MathF.Abs(Math.Abs(relative) - MathF.PI / 2f);
+            }
+            weldDrift = sum / weldPairs.Count;
+        }
+
         FfiStats? ffi = null;
         if (backend == "rapier")
         {
@@ -256,11 +406,20 @@ public static class Scenes
                 RapierPhysicsMetrics.StepMicros,
                 RapierPhysicsMetrics.StatesMicros,
                 RapierPhysicsMetrics.EventsMicros,
+                RapierPhysicsMetrics.OrchestrationMicros,
                 RapierPhysicsMetrics.ApplyCalls,
                 RapierPhysicsMetrics.StepCalls,
                 RapierPhysicsMetrics.CommandsApplied,
                 RapierPhysicsMetrics.StatesCopied,
                 RapierPhysicsMetrics.EventsCopied,
+                RapierPhysicsMetrics.PairFilterCalls,
+                RapierPhysicsMetrics.JointsSeen,
+                RapierPhysicsMetrics.JointCommands,
+                RapierPhysicsMetrics.JointBreaks,
+                RapierPhysicsMetrics.DirtySyncs,
+                RapierPhysicsMetrics.AuditTicks,
+                RapierPhysicsMetrics.AuditMisses,
+                RapierPhysicsMetrics.FullSyncTicks,
                 (long[])RapierPhysicsMetrics.OpCounts.Clone());
         }
 
@@ -280,12 +439,38 @@ public static class Scenes
             gen0,
             gen1,
             gen2,
+            jointCount,
+            weldDrift,
+            PreventCollideCancellerSystem.Calls,
             ffi);
     }
 
     public static List<string> Sanity(Outcome o)
     {
         var problems = new List<string>();
+        if (o.Scene == "prevent")
+        {
+            if (o.Contacts != 0) problems.Add($"prevent filter leaked {o.Contacts} contacts");
+            if (o.PreventCalls == 0) problems.Add("PreventCollideEvent never raised");
+            if (o.MinY > -5f) problems.Add($"bodies did not fall through, min_y = {o.MinY}");
+            return problems;
+        }
+
+        if (o.Scene == "chain")
+        {
+            if (o.Joints != ChainLinks + RopeBeads) problems.Add($"joint count {o.Joints} != {ChainLinks + RopeBeads}");
+            if (o.MinY < 0f) problems.Add($"chain fell apart, min_y = {o.MinY}");
+            return problems;
+        }
+
+        if (o.Scene == "welds")
+        {
+            if (o.Joints != WeldPairs) problems.Add($"joint count {o.Joints} != {WeldPairs}");
+            if (o.WeldDrift > 0.2f) problems.Add($"welds drifted {o.WeldDrift} rad");
+            if (o.MinY < -0.5f) problems.Add($"welded pairs fell through, min_y = {o.MinY}");
+            return problems;
+        }
+
         if (o.Contacts == 0 && o.Dynamics > 0) problems.Add("no collision events observed");
         if (o.MinY < -0.5f) problems.Add($"body fell through the floor, min_y = {o.MinY}");
         if (o.Scene == "mover" && o.CargoDx < 1.0f) problems.Add($"cargo not carried, mean dx = {o.CargoDx}");
@@ -396,5 +581,27 @@ public sealed class ContactCounterSystem : EntitySystem
     private static void OnStartCollide(Entity<PhysicsComponent> ent, ref StartCollideEvent args)
     {
         Starts++;
+    }
+}
+
+public sealed class PreventCollideCancellerSystem : EntitySystem
+{
+    public static long Calls;
+    public static bool Enabled;
+
+    public override void Initialize()
+    {
+        base.Initialize();
+        SubscribeLocalEvent<PhysicsComponent, PreventCollideEvent>(OnPreventCollide);
+    }
+
+    private static void OnPreventCollide(Entity<PhysicsComponent> ent, ref PreventCollideEvent args)
+    {
+        if (!Enabled)
+            return;
+
+        Calls++;
+        if (args.OtherBody.BodyType == BodyType.Dynamic)
+            args.Cancelled = true;
     }
 }

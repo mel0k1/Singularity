@@ -5,6 +5,7 @@ using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
+using Robust.Shared.Configuration;
 using Robust.Shared.GameObjects;
 using Robust.Shared.Log;
 using Robust.Shared.Map;
@@ -12,6 +13,7 @@ using Robust.Shared.Maths;
 using Robust.Shared.Physics.Collision.Shapes;
 using Robust.Shared.Physics.Components;
 using Robust.Shared.Physics.Dynamics;
+using Robust.Shared.Physics.Dynamics.Joints;
 using Robust.Shared.Physics.Events;
 using Robust.Shared.Physics.Systems;
 using Robust.Shared.Utility;
@@ -31,7 +33,16 @@ public static class RapierPhysicsMetrics
     public static long CommandsApplied;
     public static long StatesCopied;
     public static long EventsCopied;
-    public static readonly long[] OpCounts = new long[16];
+    public static double OrchestrationMicros;
+    public static long PairFilterCalls;
+    public static long JointsSeen;
+    public static long JointCommands;
+    public static long JointBreaks;
+    public static long DirtySyncs;
+    public static long AuditTicks;
+    public static long AuditMisses;
+    public static long FullSyncTicks;
+    public static readonly long[] OpCounts = new long[32];
 
     public static void Reset()
     {
@@ -46,20 +57,31 @@ public static class RapierPhysicsMetrics
         CommandsApplied = 0;
         StatesCopied = 0;
         EventsCopied = 0;
+        OrchestrationMicros = 0.0;
+        PairFilterCalls = 0;
+        JointsSeen = 0;
+        JointCommands = 0;
+        JointBreaks = 0;
+        DirtySyncs = 0;
+        AuditTicks = 0;
+        AuditMisses = 0;
+        FullSyncTicks = 0;
         Array.Clear(OpCounts);
     }
 }
 
-internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
+internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend, IEntityEventSubscriber
 {
     private const float PoseEpsilon = 1e-5f;
     private const float VelocityEpsilon = 1e-6f;
+    private const int AuditInterval = 32;
 
     public string Name => "rapier";
 
     private readonly SharedPhysicsSystem _physics;
     private readonly IEntityManager _entityManager;
     private readonly SharedTransformSystem _transform;
+    private readonly SharedJointSystem _joints;
     private readonly ISawmill _sawmill;
     private readonly EntityQuery<PhysicsComponent> _physicsQuery;
     private readonly EntityQuery<FixturesComponent> _fixturesQuery;
@@ -75,40 +97,148 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
     private readonly Dictionary<EntityUid, long> _fixtureStamps = new();
     private readonly Dictionary<ulong, FixtureRef> _colliderIds = new();
     private readonly Dictionary<MapId, List<BodyInput>> _pending = new();
+    private readonly Dictionary<MapId, List<ulong>> _pendingRemovals = new();
+    private readonly Dictionary<MapId, Dictionary<ulong, MirrorJoint>> _mirrorJoints = new();
+    private readonly Dictionary<(int, int, string), ulong> _jointIds = new();
+    private readonly Dictionary<ulong, Joint> _jointByNumericId = new();
     private readonly List<MapId> _activeMaps = new();
     private readonly HashSet<ulong> _seenIds = new();
+    private readonly HashSet<Joint> _seenJoints = new();
     private readonly List<ulong> _staleBodies = new();
     private readonly List<string> _staleFixtures = new();
+    private readonly List<ulong> _staleJoints = new();
+    private readonly HashSet<EntityUid> _dirty = new();
+    private readonly List<EntityUid> _dirtyList = new();
+    private readonly List<EntityUid> _gridStack = new();
+    private readonly List<BodyInput> _emptyBodies = new();
 
     private RapierNative.SgCommand[] _commands = GC.AllocateArray<RapierNative.SgCommand>(8192, pinned: true);
     private float[] _vertices = GC.AllocateArray<float>(65536, pinned: true);
     private RapierNative.SgBodyState[] _states = GC.AllocateArray<RapierNative.SgBodyState>(8192, pinned: true);
     private RapierNative.SgContactEvent[] _events = GC.AllocateArray<RapierNative.SgContactEvent>(8192, pinned: true);
+    private RapierNative.SgJointEvent[] _jointEvents = GC.AllocateArray<RapierNative.SgJointEvent>(256, pinned: true);
 
     private int _commandCount;
     private int _vertexCount;
     private bool _verticesDirty;
     private ulong _nextColliderId = 1;
+    private ulong _nextJointId = 1;
+    private int _tick;
+    private readonly bool _forceFullSync;
+    private readonly bool _nativeSleep;
+    private bool _fullScanTick;
     private bool _warnedUnsupportedShape;
+    private bool _warnedUnsupportedJoint;
+    private bool _warnedFilterFailure;
+    private bool _warnedAuditMiss;
+    private readonly RapierNative.PairFilterCallback _pairFilterDelegate;
+    private readonly GCHandle _selfHandle;
 
     public RapierPhysicsBackend(SharedPhysicsSystem physics, IEntityManager entityManager)
     {
         _physics = physics;
         _entityManager = entityManager;
         _transform = _entityManager.System<SharedTransformSystem>();
+        _joints = _entityManager.System<SharedJointSystem>();
         _physicsQuery = _entityManager.GetEntityQuery<PhysicsComponent>();
         _fixturesQuery = _entityManager.GetEntityQuery<FixturesComponent>();
         _xformQuery = _entityManager.GetEntityQuery<TransformComponent>();
         _sawmill = Logger.GetSawmill("physics.rapier");
+        _forceFullSync =
+            Environment.GetEnvironmentVariable("SINGULARITY_RAPIER_SYNC")?.Trim().ToLowerInvariant() == "full";
+        _nativeSleep =
+            Environment.GetEnvironmentVariable("SINGULARITY_RAPIER_SLEEP")?.Trim().ToLowerInvariant() == "native";
         RapierNative.EnsureLoaded();
         var abi = RapierNative.sg_abi_version();
         if (abi != RapierNative.AbiVersion)
             throw new InvalidOperationException($"physics ffi abi {abi} != {RapierNative.AbiVersion}");
+
+        _pairFilterDelegate = PairFilterTrampoline;
+        _selfHandle = GCHandle.Alloc(this);
+        _entityManager.EntityDeleted += OnEntityDeleted;
+        _entityManager.EventBus.SubscribeEvent<CollisionChangeEvent>(EventSource.Local, this, OnCollisionChange);
+    }
+
+    private void OnEntityDeleted(Entity<MetaDataComponent> entity)
+    {
+        _dirty.Add(entity.Owner);
+    }
+
+    private void OnCollisionChange(ref CollisionChangeEvent args)
+    {
+        _dirty.Add(args.BodyUid);
+    }
+
+    private static uint PairFilterTrampoline(IntPtr ctx, ulong a, ulong b)
+    {
+        if (GCHandle.FromIntPtr(ctx).Target is not RapierPhysicsBackend self)
+            return 1;
+
+        return self.ShouldPairCollide(a, b) ? 1u : 0u;
+    }
+
+    private bool ShouldPairCollide(ulong colliderA, ulong colliderB)
+    {
+        RapierPhysicsMetrics.PairFilterCalls++;
+        if (!_colliderIds.TryGetValue(colliderA, out var a) || !_colliderIds.TryGetValue(colliderB, out var b))
+            return true;
+
+        if (!_physicsQuery.TryGetComponent(a.Uid, out var bodyA)
+            || !_physicsQuery.TryGetComponent(b.Uid, out var bodyB)
+            || !_fixturesQuery.TryGetComponent(a.Uid, out var fixturesA)
+            || !_fixturesQuery.TryGetComponent(b.Uid, out var fixturesB)
+            || !_xformQuery.TryGetComponent(a.Uid, out var xformA)
+            || !_xformQuery.TryGetComponent(b.Uid, out var xformB)
+            || !fixturesA.Fixtures.TryGetValue(a.FixtureId, out var fixtureA)
+            || !fixturesB.Fixtures.TryGetValue(b.FixtureId, out var fixtureB))
+            return true;
+
+        try
+        {
+            return _physics.ShouldCollideSlow(a.Uid, b.Uid, bodyA, bodyB, fixtureA, fixtureB, xformA, xformB);
+        }
+        catch (Exception e)
+        {
+            if (!_warnedFilterFailure)
+            {
+                _warnedFilterFailure = true;
+                _sawmill.Warning($"pair filter threw, allowing pair: {e.Message}");
+            }
+
+            return true;
+        }
     }
 
     public void Step(float frameTime)
     {
-        CollectBodies();
+        var t0 = Stopwatch.GetTimestamp();
+        _tick++;
+        foreach (var list in _pending.Values)
+        {
+            list.Clear();
+        }
+
+        foreach (var list in _pendingRemovals.Values)
+        {
+            list.Clear();
+        }
+
+        CollectDirty();
+        var fullSync = _forceFullSync || _tick % AuditInterval == 1;
+        _fullScanTick = fullSync;
+        if (fullSync)
+        {
+            RapierPhysicsMetrics.FullSyncTicks++;
+            if (_tick != 1)
+                RapierPhysicsMetrics.AuditTicks++;
+            CollectBodies(!fullSync);
+        }
+        else
+        {
+            BuildPendingFromDirty();
+        }
+
+        RapierPhysicsMetrics.OrchestrationMicros += ElapsedMicros(t0);
 
         _activeMaps.Clear();
         foreach (var map in _worlds.Keys)
@@ -122,9 +252,18 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
                 _activeMaps.Add(map);
         }
 
+        foreach (var map in _pendingRemovals.Keys)
+        {
+            if (!_worlds.ContainsKey(map) && _pendingRemovals[map].Count > 0 && !_activeMaps.Contains(map))
+                _activeMaps.Add(map);
+        }
+
         foreach (var map in _activeMaps)
         {
-            if (!_pending.TryGetValue(map, out var bodies) || bodies.Count == 0)
+            var bodies = _pending.TryGetValue(map, out var list) && list.Count > 0 ? list : _emptyBodies;
+            var removals = _pendingRemovals.TryGetValue(map, out var removeList) && removeList.Count > 0;
+            var mirrorCount = _mapBodies.TryGetValue(map, out var set) ? set.Count : 0;
+            if (bodies.Count == 0 && !removals && mirrorCount == 0)
             {
                 DestroyWorld(map);
                 continue;
@@ -136,6 +275,8 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
 
     public void Shutdown()
     {
+        _entityManager.EntityDeleted -= OnEntityDeleted;
+        _entityManager.EventBus.UnsubscribeEvent<CollisionChangeEvent>(EventSource.Local, this);
         foreach (var world in _worlds.Values)
         {
             RapierNative.sg_world_destroy(world);
@@ -163,19 +304,166 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         }
 
         _pending.Clear();
+        foreach (var list in _pendingRemovals.Values)
+        {
+            list.Clear();
+        }
+
+        _pendingRemovals.Clear();
+        foreach (var joints in _mirrorJoints.Values)
+        {
+            joints.Clear();
+        }
+
+        _mirrorJoints.Clear();
+        _jointIds.Clear();
+        _jointByNumericId.Clear();
         _activeMaps.Clear();
         _seenIds.Clear();
+        _seenJoints.Clear();
         _staleBodies.Clear();
         _staleFixtures.Clear();
+        _staleJoints.Clear();
+        _dirty.Clear();
+        _dirtyList.Clear();
+        _gridStack.Clear();
+        if (_selfHandle.IsAllocated)
+        {
+            _selfHandle.Free();
+        }
     }
 
-    private void CollectBodies()
+    private void CollectDirty()
+    {
+        foreach (var ent in _physics.AwakeBodies)
+        {
+            _dirty.Add(ent.Owner);
+        }
+
+        foreach (var proxy in _physics.MoveBuffer)
+        {
+            _dirty.Add(proxy.Entity);
+        }
+
+        _physics.MoveBuffer.Clear();
+        foreach (var grid in _physics.MovedGrids)
+        {
+            if (!_xformQuery.TryGetComponent(grid, out var gridXform))
+                continue;
+
+            _gridStack.Clear();
+            _gridStack.Add(grid);
+            while (_gridStack.Count > 0)
+            {
+                var uid = _gridStack[^1];
+                _gridStack.RemoveAt(_gridStack.Count - 1);
+                if (_physicsQuery.HasComp(uid))
+                    _dirty.Add(uid);
+
+                if (!_xformQuery.TryGetComponent(uid, out var xform))
+                    continue;
+
+                var childEnum = xform.ChildEnumerator;
+                while (childEnum.MoveNext(out var child))
+                {
+                    _gridStack.Add(child);
+                }
+
+                childEnum.Dispose();
+            }
+        }
+
+        _physics.MovedGrids.Clear();
+    }
+
+    private void BuildPendingFromDirty()
+    {
+        _dirtyList.Clear();
+        if (_dirty.Count > 0)
+        {
+            _dirtyList.AddRange(_dirty);
+            _dirty.Clear();
+        }
+
+        foreach (var uid in _dirtyList)
+        {
+            if (TerminatingOrDeleted(uid)
+                || !_physicsQuery.TryGetComponent(uid, out var body)
+                || !_fixturesQuery.TryGetComponent(uid, out var fixtures)
+                || !_xformQuery.TryGetComponent(uid, out var xform)
+                || !body.CanCollide
+                || xform.MapID == MapId.Nullspace)
+            {
+                RemoveFromMirror(uid);
+                continue;
+            }
+
+            RapierPhysicsMetrics.DirtySyncs++;
+            AddPending(uid, body, fixtures, xform);
+        }
+    }
+
+    private void AddPending(EntityUid uid, PhysicsComponent body, FixturesComponent fixtures, TransformComponent xform)
+    {
+        var bodyId = (ulong)uid.Id;
+        if (_bodyMap.TryGetValue(bodyId, out var mirrored) && mirrored != xform.MapID)
+        {
+            if (!_pendingRemovals.TryGetValue(mirrored, out var removals))
+            {
+                removals = new List<ulong>();
+                _pendingRemovals[mirrored] = removals;
+            }
+
+            if (!removals.Contains(bodyId))
+                removals.Add(bodyId);
+        }
+
+        if (!_pending.TryGetValue(xform.MapID, out var list))
+        {
+            list = new List<BodyInput>();
+            _pending[xform.MapID] = list;
+        }
+
+        list.Add(new BodyInput(uid, body, fixtures, xform));
+    }
+
+    private void RemoveFromMirror(EntityUid uid)
+    {
+        var bodyId = (ulong)uid.Id;
+        if (!_bodyMap.TryGetValue(bodyId, out var map))
+            return;
+
+        if (_bodyUids.TryGetValue(bodyId, out var known) && known != uid)
+            return;
+
+        if (!_pendingRemovals.TryGetValue(map, out var removals))
+        {
+            removals = new List<ulong>();
+            _pendingRemovals[map] = removals;
+        }
+
+        if (!removals.Contains(bodyId))
+            removals.Add(bodyId);
+    }
+
+    private bool TerminatingOrDeleted(EntityUid uid)
+    {
+        return !_entityManager.EntityExists(uid) || _entityManager.IsQueuedForDeletion(uid);
+    }
+
+    private void CollectBodies(bool countMisses)
     {
         foreach (var list in _pending.Values)
         {
             list.Clear();
         }
 
+        foreach (var list in _pendingRemovals.Values)
+        {
+            list.Clear();
+        }
+
+        _seenIds.Clear();
         var enumerator = _entityManager.AllEntityQueryEnumerator<PhysicsComponent, FixturesComponent, TransformComponent>();
         while (enumerator.MoveNext(out var uid, out var body, out var fixtures, out var xform))
         {
@@ -185,6 +473,17 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
             if (xform.MapID == MapId.Nullspace)
                 continue;
 
+            if (countMisses && !_dirty.Contains(uid))
+            {
+                var bodyId = (ulong)uid.Id;
+                if (!_bodyMap.TryGetValue(bodyId, out _) || _bodyUids.GetValueOrDefault(bodyId) != uid)
+                {
+                    RapierPhysicsMetrics.AuditMisses++;
+                    WarnAuditMiss($"body {uid} missing from mirror");
+                }
+            }
+
+            _seenIds.Add((ulong)uid.Id);
             if (!_pending.TryGetValue(xform.MapID, out var list))
             {
                 list = new List<BodyInput>();
@@ -195,6 +494,45 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         }
 
         enumerator.Dispose();
+        foreach (var map in _mapBodies.Keys)
+        {
+            if (!_mapBodies.TryGetValue(map, out var ids))
+                continue;
+
+            _staleBodies.Clear();
+            foreach (var bodyId in ids)
+            {
+                if (_seenIds.Contains(bodyId))
+                    continue;
+
+                _staleBodies.Add(bodyId);
+                if (countMisses && !_dirty.Contains(_bodyUids.GetValueOrDefault(bodyId)))
+                {
+                    RapierPhysicsMetrics.AuditMisses++;
+                    WarnAuditMiss($"body {bodyId} stale in mirror for map {map}");
+                }
+            }
+
+            foreach (var bodyId in _staleBodies)
+            {
+                if (!_pendingRemovals.TryGetValue(map, out var removals))
+                {
+                    removals = new List<ulong>();
+                    _pendingRemovals[map] = removals;
+                }
+
+                removals.Add(bodyId);
+            }
+        }
+    }
+
+    private void WarnAuditMiss(string what)
+    {
+        if (_warnedAuditMiss)
+            return;
+
+        _warnedAuditMiss = true;
+        _sawmill.Warning($"audit found an unsignalled change ({what}); event coverage gap, will self-correct");
     }
 
     private void DestroyWorld(MapId map)
@@ -202,6 +540,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         if (!_worlds.TryGetValue(map, out var world))
             return;
 
+        RapierNative.sg_world_set_pair_filter(world, null, IntPtr.Zero);
         RapierNative.sg_world_destroy(world);
         _worlds.Remove(map);
         _mirrorGravity.Remove(map);
@@ -214,6 +553,18 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
 
             _mapBodies.Remove(map);
         }
+
+        if (_mirrorJoints.TryGetValue(map, out var joints))
+        {
+            foreach (var joint in joints.Values)
+            {
+                _jointByNumericId.Remove(joint.NumericId);
+                _jointIds.Remove(joint.Key);
+            }
+
+            joints.Clear();
+            _mirrorJoints.Remove(map);
+        }
     }
 
     private void StepMap(MapId map, List<BodyInput> bodies, float frameTime)
@@ -223,6 +574,15 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
             world = RapierNative.sg_world_create();
             _worlds[map] = world;
             _mapBodies[map] = new HashSet<ulong>();
+            _mirrorJoints[map] = new Dictionary<ulong, MirrorJoint>();
+            RapierNative.sg_world_set_pair_filter(world, _pairFilterDelegate, GCHandle.ToIntPtr(_selfHandle));
+            if (!_nativeSleep)
+            {
+                var timeToSleep = _physics.Cfg.GetCVar(CVars.TimeToSleep);
+                var linearTolerance = _physics.Cfg.GetCVar(CVars.LinearSleepTolerance);
+                var angularTolerance = _physics.Cfg.GetCVar(CVars.AngularSleepTolerance);
+                RapierNative.sg_world_set_sleep(world, timeToSleep, linearTolerance, angularTolerance);
+            }
         }
 
         var mapSet = _mapBodies[map];
@@ -230,24 +590,40 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         _commandCount = 0;
         _vertexCount = 0;
         _verticesDirty = false;
-        _seenIds.Clear();
-        foreach (var input in bodies)
+
+        if (_pendingRemovals.TryGetValue(map, out var removals) && removals.Count > 0)
         {
-            _seenIds.Add((ulong)input.Uid.Id);
+            foreach (var bodyId in removals)
+            {
+                Push(RapierNative.OpRemoveBody, bodyId, 0, 0);
+                mapSet.Remove(bodyId);
+                ForgetBody(bodyId, map);
+            }
+
+            removals.Clear();
         }
 
-        _staleBodies.Clear();
-        foreach (var bodyId in mapSet)
+        if (_fullScanTick)
         {
-            if (!_seenIds.Contains(bodyId))
-                _staleBodies.Add(bodyId);
-        }
+            _seenIds.Clear();
+            foreach (var input in bodies)
+            {
+                _seenIds.Add((ulong)input.Uid.Id);
+            }
 
-        foreach (var bodyId in _staleBodies)
-        {
-            Push(RapierNative.OpRemoveBody, bodyId, 0, 0);
-            mapSet.Remove(bodyId);
-            ForgetBody(bodyId, map);
+            _staleBodies.Clear();
+            foreach (var bodyId in mapSet)
+            {
+                if (!_seenIds.Contains(bodyId))
+                    _staleBodies.Add(bodyId);
+            }
+
+            foreach (var bodyId in _staleBodies)
+            {
+                Push(RapierNative.OpRemoveBody, bodyId, 0, 0);
+                mapSet.Remove(bodyId);
+                ForgetBody(bodyId, map);
+            }
         }
 
         var gravity = _physics.Gravity;
@@ -261,6 +637,8 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         {
             SyncBody(map, input);
         }
+
+        SyncJoints(map);
 
         fixed (float* vertexPtr = _vertices)
         {
@@ -289,6 +667,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
 
         Writeback(world);
         RaiseEvents(world);
+        RaiseJointEvents(world);
     }
 
     private void SyncBody(MapId map, in BodyInput input)
@@ -300,6 +679,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         var bodyId = (ulong)uid.Id;
         var kind = KindOf(body.BodyType);
         var mapSet = _mapBodies[map];
+
         var known = _bodyUids.TryGetValue(bodyId, out var knownUid) && knownUid == uid && mapSet.Contains(bodyId);
         if (!known)
         {
@@ -356,6 +736,19 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
             mirror.FixedRotation = body.FixedRotation;
         }
 
+        if (body.SleepingAllowed != mirror.SleepingAllowed)
+        {
+            Push(
+                RapierNative.OpSetSleep,
+                bodyId,
+                0,
+                0,
+                _physics.Cfg.GetCVar(CVars.TimeToSleep),
+                _physics.Cfg.GetCVar(CVars.LinearSleepTolerance),
+                _physics.Cfg.GetCVar(CVars.AngularSleepTolerance),
+                body.SleepingAllowed ? 1.0f : 0.0f);
+            mirror.SleepingAllowed = body.SleepingAllowed;
+        }
         if (kind != RapierNative.KindStatic)
         {
             if (body.Awake
@@ -403,10 +796,6 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
                 Push(RapierNative.OpSetAwake, bodyId, (ulong)(body.Awake ? 1 : 0), 0);
                 mirror.Awake = body.Awake;
             }
-            else if (body.Awake && !body.SleepingAllowed)
-            {
-                Push(RapierNative.OpSetAwake, bodyId, 1, 0);
-            }
         }
         else
         {
@@ -415,6 +804,195 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
 
         SyncFixtures(uid, bodyId, fixtures);
         _mirror[bodyId] = mirror;
+    }
+
+    private void SyncJoints(MapId map)
+    {
+        var mirror = _mirrorJoints[map];
+        var mapSet = _mapBodies[map];
+        _seenJoints.Clear();
+        _staleJoints.Clear();
+        foreach (var pair in mirror)
+        {
+            if (!_seenJoints.Contains(pair.Value.Joint))
+                _staleJoints.Add(pair.Key);
+        }
+
+        var enumerator = _entityManager.AllEntityQueryEnumerator<JointComponent>();
+        while (enumerator.MoveNext(out var uid, out var component))
+        {
+            foreach (var joint in component.Joints.Values)
+            {
+                if (!_seenJoints.Add(joint))
+                    continue;
+
+                RapierPhysicsMetrics.JointsSeen++;
+                var bodyA = joint.BodyAUid;
+                var bodyBUid = joint.BodyBUid;
+                var idA = (ulong)bodyA.Id;
+                var idB = (ulong)bodyBUid.Id;
+                if (!mapSet.Contains(idA) || !mapSet.Contains(idB))
+                    continue;
+
+                if (!_physicsQuery.TryGetComponent(bodyA, out _) || !_physicsQuery.TryGetComponent(bodyBUid, out _))
+                    continue;
+
+                if (!_xformQuery.TryGetComponent(bodyA, out var xformA) || !_xformQuery.TryGetComponent(bodyBUid, out var xformB))
+                    continue;
+
+                if (xformA.MapID != map || xformB.MapID != map)
+                    continue;
+
+                if (!TryJointParams(joint, out var kind, out var parameters))
+                {
+                    if (!_warnedUnsupportedJoint)
+                    {
+                        _warnedUnsupportedJoint = true;
+                        _sawmill.Warning($"unsupported joint type {joint.JointType} not mirrored");
+                    }
+
+                    continue;
+                }
+
+                var key = JointKey(idA, idB, joint.ID);
+                if (!_jointIds.TryGetValue(key, out var numericId))
+                {
+                    numericId = _nextJointId++;
+                    _jointIds[key] = numericId;
+                }
+
+                var fingerprint = JointFingerprint(joint, kind, parameters, numericId);
+                if (mirror.TryGetValue(numericId, out var existing) && existing.Fingerprint == fingerprint)
+                {
+                    _staleJoints.Remove(numericId);
+                    continue;
+                }
+
+                if (existing.Fingerprint != 0)
+                {
+                    Push(RapierNative.OpRemoveJoint, numericId, 0, 0);
+                    RapierPhysicsMetrics.JointCommands++;
+                }
+
+                Push(
+                    RapierNative.OpAddJoint,
+                    numericId,
+                    idA,
+                    idB,
+                    joint.LocalAnchorA.X,
+                    joint.LocalAnchorA.Y,
+                    joint.LocalAnchorB.X,
+                    joint.LocalAnchorB.Y,
+                    joint.CollideConnected ? 1.0f : 0.0f,
+                    joint.Enabled ? 1.0f : 0.0f,
+                    joint.Breakpoint,
+                    kind);
+                Push(RapierNative.OpSetJointParams, numericId, 0, 0,
+                    parameters[0], parameters[1], parameters[2], parameters[3],
+                    parameters[4], parameters[5], parameters[6], parameters[7]);
+                RapierPhysicsMetrics.JointCommands += 2;
+                mirror[numericId] = new MirrorJoint(numericId, key, joint, fingerprint);
+                _jointByNumericId[numericId] = joint;
+                _staleJoints.Remove(numericId);
+            }
+        }
+
+        enumerator.Dispose();
+        foreach (var numericId in _staleJoints)
+        {
+            var existing = mirror[numericId];
+            Push(RapierNative.OpRemoveJoint, numericId, 0, 0);
+            RapierPhysicsMetrics.JointCommands++;
+            mirror.Remove(numericId);
+            _jointByNumericId.Remove(numericId);
+            _jointIds.Remove(existing.Key);
+        }
+    }
+
+    private static (int, int, string) JointKey(ulong idA, ulong idB, string jointId)
+    {
+        var lo = (int)Math.Min(idA, idB);
+        var hi = (int)Math.Max(idA, idB);
+        return (lo, hi, jointId);
+    }
+
+    private static bool TryJointParams(Joint joint, out uint kind, out float[] parameters)
+    {
+        switch (joint)
+        {
+            case DistanceJoint distance:
+                if (distance.Stiffness > 0f)
+                {
+                    kind = RapierNative.JointDistanceSpring;
+                    parameters = new[] { distance.Length, distance.Stiffness, distance.Damping, 0f, 0f, 0f, 0f, 0f };
+                }
+                else
+                {
+                    kind = RapierNative.JointDistanceRigid;
+                    parameters = new[] { distance.MinLength, distance.MaxLength, 0f, 0f, 0f, 0f, 0f, 0f };
+                }
+
+                return true;
+            case RevoluteJoint revolute:
+                kind = RapierNative.JointRevolute;
+                var revoluteFlags = (revolute.EnableLimit ? RapierNative.JointLimitEnabled : 0f)
+                                    + (revolute.EnableMotor ? RapierNative.JointMotorEnabled : 0f);
+                parameters = new[]
+                {
+                    revolute.ReferenceAngle, revolute.LowerAngle, revolute.UpperAngle, revoluteFlags,
+                    revolute.MotorSpeed, revolute.MaxMotorTorque, 0f, 0f,
+                };
+                return true;
+            case PrismaticJoint prismatic:
+                kind = RapierNative.JointPrismatic;
+                var prismaticFlags = (prismatic.EnableLimit ? RapierNative.JointLimitEnabled : 0f)
+                                     + (prismatic.EnableMotor ? RapierNative.JointMotorEnabled : 0f);
+                parameters = new[]
+                {
+                    prismatic.LocalAxisA.X, prismatic.LocalAxisA.Y, prismatic.ReferenceAngle,
+                    prismatic.LowerTranslation, prismatic.UpperTranslation, prismaticFlags,
+                    prismatic.MotorSpeed, prismatic.MaxMotorForce,
+                };
+                return true;
+            case WeldJoint weld:
+                kind = RapierNative.JointWeld;
+                parameters = new[] { weld.ReferenceAngle, 0f, 0f, 0f, 0f, 0f, 0f, 0f };
+                return true;
+            default:
+                kind = 0;
+                parameters = Array.Empty<float>();
+                return false;
+        }
+    }
+
+    private static uint JointFingerprint(Joint joint, uint kind, float[] parameters, ulong numericId)
+    {
+        var hash = 2166136261u;
+        FoldU(kind);
+        FoldU((uint)numericId);
+        FoldF(joint.LocalAnchorA.X);
+        FoldF(joint.LocalAnchorA.Y);
+        FoldF(joint.LocalAnchorB.X);
+        FoldF(joint.LocalAnchorB.Y);
+        FoldF(joint.CollideConnected ? 1f : 0f);
+        FoldF(joint.Enabled ? 1f : 0f);
+        FoldF(joint.Breakpoint);
+        foreach (var value in parameters)
+        {
+            FoldF(value);
+        }
+
+        return hash;
+
+        void FoldF(float value)
+        {
+            hash = (hash ^ BitConverter.SingleToUInt32Bits(value)) * 16777619u;
+        }
+
+        void FoldU(uint value)
+        {
+            hash = (hash ^ value) * 16777619u;
+        }
     }
 
     private void SyncFixtures(EntityUid uid, ulong bodyId, FixturesComponent fixtures)
@@ -596,6 +1174,16 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
 
             _mirror.TryGetValue(state.Id, out var mirror);
             var asleep = (state.Flags & RapierNative.FlagAsleep) != 0;
+            var unchanged = MathF.Abs(state.X - mirror.X) <= PoseEpsilon
+                            && MathF.Abs(state.Y - mirror.Y) <= PoseEpsilon
+                            && MathF.Abs(state.Angle - mirror.Angle) <= PoseEpsilon
+                            && MathF.Abs(state.Vx - mirror.Vx) <= VelocityEpsilon
+                            && MathF.Abs(state.Vy - mirror.Vy) <= VelocityEpsilon
+                            && MathF.Abs(state.Omega - mirror.Omega) <= VelocityEpsilon
+                            && asleep != body.Awake;
+            if (unchanged)
+                continue;
+
             mirror.Awake = !asleep;
             mirror.X = state.X;
             mirror.Y = state.Y;
@@ -605,7 +1193,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
             mirror.Omega = state.Omega;
 
             if (asleep == body.Awake && body.SleepingAllowed)
-                _physics.SetAwake(uid, body, !asleep);
+                _physics.SetAwake((uid, body), !asleep);
 
             if (asleep)
             {
@@ -718,6 +1306,41 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         }
     }
 
+    private void RaiseJointEvents(IntPtr world)
+    {
+        var count = (int)RapierNative.sg_world_joint_event_count(world);
+        if (count == 0)
+            return;
+
+        if (count > _jointEvents.Length)
+        {
+            var grown = GC.AllocateArray<RapierNative.SgJointEvent>(Math.Max(count, _jointEvents.Length * 2), pinned: true);
+            _jointEvents = grown;
+        }
+
+        fixed (RapierNative.SgJointEvent* eventPtr = _jointEvents)
+        {
+            count = (int)RapierNative.sg_world_copy_joint_events(world, eventPtr, (UIntPtr)count);
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            ref var e = ref _jointEvents[i];
+            if (!_jointByNumericId.TryGetValue(e.Id, out var joint))
+                continue;
+
+            RapierPhysicsMetrics.JointBreaks++;
+            var ev = new JointBreakEvent(joint, e.Impulse);
+            _physics.BackendRaiseLocal(joint.BodyAUid, ref ev);
+            _physics.BackendRaiseLocal(joint.BodyBUid, ref ev);
+            _physics.BackendRaiseBroadcast(ref ev);
+            _joints.SetEnabled(joint, false);
+            joint.Dirty();
+            _dirty.Add(joint.BodyAUid);
+            _dirty.Add(joint.BodyBUid);
+        }
+    }
+
     private void ForgetBody(ulong bodyId, MapId map)
     {
         if (_bodyMap.TryGetValue(bodyId, out var owner) && owner != map)
@@ -797,7 +1420,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
             P6 = p6,
             P7 = p7,
         };
-        RapierPhysicsMetrics.OpCounts[op & 15]++;
+        RapierPhysicsMetrics.OpCounts[op & 31]++;
     }
 
     private void EnsureStates(int count)
@@ -941,6 +1564,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         public float AngDamp;
         public ulong Kind;
         public bool FixedRotation;
+        public bool SleepingAllowed;
         public bool Awake;
 
         public static MirrorState Fresh()
@@ -959,6 +1583,7 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
                 LinDamp = float.NegativeInfinity,
                 AngDamp = float.NegativeInfinity,
                 Kind = ulong.MaxValue,
+                SleepingAllowed = true,
                 Awake = true,
             };
         }
@@ -984,6 +1609,22 @@ internal sealed unsafe class RapierPhysicsBackend : IPhysicsBackend
         public MirrorFixture(ulong colliderId, uint fingerprint)
         {
             ColliderId = colliderId;
+            Fingerprint = fingerprint;
+        }
+    }
+
+    private readonly struct MirrorJoint
+    {
+        public readonly ulong NumericId;
+        public readonly (int, int, string) Key;
+        public readonly Joint Joint;
+        public readonly uint Fingerprint;
+
+        public MirrorJoint(ulong numericId, (int, int, string) key, Joint joint, uint fingerprint)
+        {
+            NumericId = numericId;
+            Key = key;
+            Joint = joint;
             Fingerprint = fingerprint;
         }
     }
