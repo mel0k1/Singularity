@@ -216,6 +216,41 @@ fn polygon_collider_from_vertex_pool() {
 }
 
 #[test]
+fn teleport_wake_flag_controls_sleeping() {
+    let mut world = drop_scene();
+    for _ in 0..600 {
+        world.step(DT);
+    }
+    let rest = find_state(&world, 2);
+    assert!(rest.flags & FLAG_ASLEEP != 0, "never slept");
+    world.apply(&[cmd(
+        OP_SET_TRANSFORM,
+        2,
+        0,
+        0,
+        [rest.x, rest.y, rest.angle, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )]);
+    world.step(DT);
+    assert!(
+        find_state(&world, 2).flags & FLAG_ASLEEP != 0,
+        "identical pose echo woke the body"
+    );
+    world.apply(&[cmd(
+        OP_SET_TRANSFORM,
+        2,
+        0,
+        0,
+        [1.0, 5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    )]);
+    world.step(DT);
+    assert_eq!(
+        find_state(&world, 2).flags & FLAG_ASLEEP,
+        0,
+        "flag did not wake"
+    );
+}
+
+#[test]
 fn remove_body_clears_state() {
     let mut world = drop_scene();
     world.apply(&[cmd(OP_REMOVE_BODY, 2, 0, 0, [0.0; 8])]);

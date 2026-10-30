@@ -162,14 +162,18 @@ impl SgWorld {
                     if let Some(body) = self.body_mut(cmd.id) {
                         body.set_position(
                             Pose2::new(Vector::new(cmd.p[0], cmd.p[1]), cmd.p[2]),
-                            false,
+                            cmd.p[3] != 0.0,
                         );
                     }
                 }
                 OP_SET_VELOCITY => {
                     if let Some(body) = self.body_mut(cmd.id) {
-                        body.set_linvel(Vector::new(cmd.p[0], cmd.p[1]), true);
-                        body.set_angvel(cmd.p[2], true);
+                        let linvel = Vector::new(cmd.p[0], cmd.p[1]);
+                        let delta = body.linvel() - linvel;
+                        let wake =
+                            delta.dot(delta) > 1.0e-12 || (body.angvel() - cmd.p[2]).abs() > 1.0e-6;
+                        body.set_linvel(linvel, wake);
+                        body.set_angvel(cmd.p[2], wake);
                     }
                 }
                 OP_SET_BODY_KIND => {
@@ -368,7 +372,8 @@ impl SgWorld {
             return;
         };
         let builder = match cmd.op {
-            OP_ADD_COLLIDER_BOX => ColliderBuilder::cuboid(cmd.p[4], cmd.p[5]),
+            OP_ADD_COLLIDER_BOX => ColliderBuilder::cuboid(cmd.p[4], cmd.p[5])
+                .translation(Vector::new(cmd.p[6], cmd.p[7])),
             OP_ADD_COLLIDER_CIRCLE => {
                 ColliderBuilder::ball(cmd.p[4]).translation(Vector::new(cmd.p[5], cmd.p[6]))
             }
