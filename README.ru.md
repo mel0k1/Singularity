@@ -55,19 +55,20 @@ FFI-контракт: C# собирает реестры — типы компо
 | `rust/crates/singularity-physics` | Rust | исследование бэкенда физики: Rapier и Avian за общим швом `PhysicsBackend`, с бенчмарком и матрицей паритета — см. [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-net-transport` · план | Rust | изучение совместимого с Lidgren транспорта |
 | `rust/crates/singularity-pvs` · план | Rust | SoA-данные видимости на сессию |
-| `csharp/` · план | C# | ядро оркестрации: ECS, IoC, сериализация, прототипы, GameStates — перенос архитектуры Robust Toolbox |
+| `csharp/engine` | C# | вендор RobustToolbox @ fdb576c — стартовая точка ядра оркестрации |
+| `csharp/benches/Singularity.PhysicsBench` | C# | Farseer замерен в лоб на реальном ECS — см. [docs/physics-bench.md](docs/physics-bench.md) |
 
 ## Статус
 
-Фаза исследования завершена. Исходники Robust Toolbox изучены подсистема за подсистемой — ECS, IoC, сериализация, прототипы, GameStates/PVS, сеть, физика, нативные границы. Два спайка реализованы, протестированы и замерены: `singularity-crypto` и `singularity-physics`.
+Фаза исследования завершена. Исходники Robust Toolbox изучены подсистема за подсистемой — ECS, IoC, сериализация, прототипы, GameStates/PVS, сеть, физика, нативные границы. Два спайка реализованы, протестированы и замерены: `singularity-crypto` и `singularity-physics`. C#-ядро подключено (вендор движка), Farseer-порт замерен в лоб: 10.9–25.8× отставания от Rapier по p50, детерминизм подтверждён, найден провал семантики KinematicController.
 
 ## Дорожная карта
 
 1. `singularity-crypto` — сделано
-2. `singularity-physics` — исследование завершено: Rapier и Avian за нейтральным швом `PhysicsBackend`, детерминизм подтверждён двойным прогоном; Rapier быстрее по p50 в 3,7–5,0 раза, у Avian замечены пики 25 мс; замена отложена до профилирования на реальном контенте. Прямое сравнение с C#-портом Farseer ждёт C#-харнесс
+2. `singularity-physics` — исследование завершено: Rapier и Avian за нейтральным швом `PhysicsBackend`, детерминизм подтверждён двойным прогоном; Rapier быстрее по p50 в 3,7–5,0 раза, у Avian замечены пики 25 мс; замена отложена до профилирования на реальном контенте. Head-to-head с портом Farseer — сделано, см. [docs/physics-bench.md](docs/physics-bench.md)
 3. `singularity-net-transport` — сначала изучить проводной протокол форка Lidgren, не трогая ни байта
 4. `singularity-pvs` — SoA-данные сессий; pinned `PvsData` уже неуправляемые
-5. Подключение C#-ядра — открывает head-to-head бенчмарк с портом Farseer
+5. Подключение C#-ядра — сделано: движок завендорен, Farseer замерен в лоб, детерминизм подтверждён
 
 ## Сборка
 
@@ -75,6 +76,11 @@ FFI-контракт: C# собирает реестры — типы компо
 cd rust
 cargo build --release
 cargo test --all
+```
+
+```sh
+cd csharp
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate
 ```
 
 ## Стиль кода

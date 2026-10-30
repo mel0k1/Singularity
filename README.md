@@ -55,19 +55,20 @@ The FFI contract: C# builds the registries — component types, network ids, ser
 | `rust/crates/singularity-physics` | Rust | physics backend study: Rapier and Avian behind a shared `PhysicsBackend` seam, benchmarked and parity-checked — see [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-net-transport` · planned | Rust | Lidgren-compatible transport study |
 | `rust/crates/singularity-pvs` · planned | Rust | SoA per-session visibility data |
-| `csharp/` · planned | C# | orchestration core: ECS, IoC, serialization, prototypes, GameStates — onboarded from the Robust Toolbox architecture |
+| `csharp/engine` | C# | vendored RobustToolbox @ fdb576c — the starting point of the orchestration core |
+| `csharp/benches/Singularity.PhysicsBench` | C# | the Farseer port measured in-situ on the real ECS — see [docs/physics-bench.md](docs/physics-bench.md) |
 
 ## Status
 
-Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Two spikes are implemented, tested and benchmarked: `singularity-crypto` and `singularity-physics`.
+Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Two spikes are implemented, tested and benchmarked: `singularity-crypto` and `singularity-physics`. The C# core is on board as a vendored engine, and the Farseer port has been measured head-to-head: 10.9–25.8x behind Rapier on p50, deterministic under double-run hashing, with a measured KinematicController parity gap.
 
 ## Roadmap
 
 1. `singularity-crypto` — done
-2. `singularity-physics` — study done: Rapier and Avian behind a neutral `PhysicsBackend` seam, deterministic under double-run hashing; Rapier leads p50 by 3.7–5.0x, Avian shows 25 ms spikes; swap deferred until profiling on real content. The head-to-head against the C# Farseer port awaits the C# harness
+2. `singularity-physics` — study done: Rapier and Avian behind a neutral `PhysicsBackend` seam, deterministic under double-run hashing; Rapier leads p50 by 3.7–5.0x, Avian shows 25 ms spikes; swap deferred until profiling on real content. Head-to-head vs the Farseer port: done — see [docs/physics-bench.md](docs/physics-bench.md)
 3. `singularity-net-transport` — study the Lidgren fork wire protocol before touching a single byte of it
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
-5. C# core onboarding — unlocks the Farseer-port head-to-head benchmark
+5. C# core onboarding — done: engine vendored (`csharp/engine`), Farseer measured in-situ (`csharp/benches`), determinism confirmed
 
 ## Building
 
@@ -75,6 +76,11 @@ Research phase complete. The Robust Toolbox sources were studied subsystem by su
 cd rust
 cargo build --release
 cargo test --all
+```
+
+```sh
+cd csharp
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate
 ```
 
 ## Code style
