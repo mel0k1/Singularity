@@ -24,3 +24,15 @@ jobs:
           workspaces: rust
       - run: cargo run --release -p singularity-physics --bin bench -- --validate
       - run: cargo run --release -p singularity-physics --bin bench
+
+  farseer:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --validate --json
