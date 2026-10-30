@@ -36,3 +36,22 @@ jobs:
         with:
           dotnet-version: 10.0.x
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --validate --json
+
+  mirror:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: cargo build --release -p singularity-physics-ffi
+        working-directory: rust
+      - run: dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=rapier --json
+      - run: dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=rapier --validate --strict --json
