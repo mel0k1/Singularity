@@ -1,6 +1,7 @@
 target
 bin
 obj
+!**/src/bin/
 *.user
 .vs
 .idea
