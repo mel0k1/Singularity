@@ -55,6 +55,7 @@ The FFI contract: C# builds the registries — component types, network ids, ser
 | `rust/crates/singularity-physics` | Rust | physics backend study: Rapier and Avian behind a shared `PhysicsBackend` seam, benchmarked and parity-checked — see [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-physics-ffi` | Rust | the C ABI seam: per-map `SgWorld`, command-buffer apply, bulk state/event copy — the native side of `IPhysicsBackend` |
 | `rust/crates/singularity-net-transport` · planned | Rust | Lidgren-compatible transport study |
+| `rust/crates/singularity-net-transport` | Rust | the transport seam below `INetChannel`: UDP transport, handshake, stop-and-wait reliability, event polling, C ABI — see [docs/net-transport.md](docs/net-transport.md) |
 | `rust/crates/singularity-pvs` · planned | Rust | SoA per-session visibility data |
 | `csharp/engine` | C# | vendored RobustToolbox @ fdb576c — the starting point of the orchestration core; carries the `IPhysicsBackend` seam behind `SharedPhysicsSystem.SimulateWorld()` |
 | `csharp/benches/Singularity.PhysicsBench` | C# | farseer and the rapier mirror measured in-situ on the real ECS — see [docs/physics-bench.md](docs/physics-bench.md) |
@@ -67,7 +68,7 @@ Research phase complete. The Robust Toolbox sources were studied subsystem by su
 
 1. `singularity-crypto` — done
 2. `singularity-physics` — done and in: `IPhysicsBackend` behind `SimulateWorld()`, rapier mirror measured in-situ (docs/physics-bench.md) — joints, pair filter, incremental collection and sleep tuning landed; prediction parity via the shared binary remains
-3. `singularity-net-transport` — study the Lidgren fork wire protocol before touching a single byte of it
+3. `singularity-net-transport` — seam spike done (docs/net-transport.md): UDP transport, event model, FFI and stop-and-wait reliability under measured loss; the Lidgren framer port is the next milestone
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
 5. C# core onboarding — done: engine vendored (`csharp/engine`), Farseer measured in-situ (`csharp/benches`), determinism confirmed
 
@@ -78,6 +79,7 @@ cd rust
 cargo build --release
 cargo test --all
 cargo run --release -p singularity-physics --bin bench
+cargo run --release -p singularity-net-transport --bin bench
 ```
 
 ```sh

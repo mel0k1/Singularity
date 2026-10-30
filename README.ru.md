@@ -31,7 +31,7 @@ C#-слой — оркестрация и контракт контента     
 ══════════════════════════════════════════            ══════════════════════════════════════════
 GameObjects/ECS · IoC · шина событий                 singularity-crypto         кадры XChaCha20-Poly1305
 YAML-сериализация · прототипы                       singularity-physics        изучение Rapier/Avian
-GameStates · оркестрация PVS                        singularity-net-transport  изучение провода Lidgren
+GameStates · оркестрация PVS                        singularity-net-transport  спайк шва сделан
 сетевые сообщения · StringTable · дискавери         singularity-pvs            SoA-данные сессий
                         └──────────── FFI-контракт ─────────┘
 ```
@@ -54,7 +54,7 @@ FFI-контракт: C# собирает реестры — типы компо
 | `rust/crates/singularity-crypto` | Rust | кодек кадров XChaCha20-Poly1305, совместим с `NetEncryption` на уровне байтов |
 | `rust/crates/singularity-physics` | Rust | исследование бэкенда физики: Rapier и Avian за общим швом `PhysicsBackend`, с бенчмарком и матрицей паритета — см. [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-physics-ffi` | Rust | C ABI-шов: `SgWorld` на карту, командный буфер, массовая выгрузка состояний и событий — нативная сторона `IPhysicsBackend` |
-| `rust/crates/singularity-net-transport` · план | Rust | изучение совместимого с Lidgren транспорта |
+| `rust/crates/singularity-net-transport` | Rust | шов под `INetChannel`: UDP-транспорт, рукопожатие, stop-and-wait надёжность, событийный опрос, C ABI — см. [docs/net-transport.md](docs/net-transport.md) |
 | `rust/crates/singularity-pvs` · план | Rust | SoA-данные видимости на сессию |
 | `csharp/engine` | C# | вендор RobustToolbox @ fdb576c — стартовая точка ядра оркестрации; несёт шов `IPhysicsBackend` за `SharedPhysicsSystem.SimulateWorld()` |
 | `csharp/benches/Singularity.PhysicsBench` | C# | Farseer и rapier-зеркало замерены в лоб на реальном ECS — см. [docs/physics-bench.md](docs/physics-bench.md) |
@@ -67,7 +67,7 @@ FFI-контракт: C# собирает реестры — типы компо
 
 1. `singularity-crypto` — сделано
 2. `singularity-physics` — сделано и внедрено: `IPhysicsBackend` за `SimulateWorld()`, rapier-зеркало замерено в лоб ([docs/physics-bench.md](docs/physics-bench.md)) — джоинты, парный фильтр, инкрементальный сбор и тюнинг сна сделаны; остался паритет предсказаний через общий бинарь
-3. `singularity-net-transport` — сначала изучить проводной протокол форка Lidgren, не трогая ни байта
+3. `singularity-net-transport` — спайк шва сделан ([docs/net-transport.md](docs/net-transport.md)): UDP-транспорт, событийная модель, FFI и stop-and-wait надёжность под измеренными потерями; порт фреймера Lidgren — следующий этап
 4. `singularity-pvs` — SoA-данные сессий; pinned `PvsData` уже неуправляемые
 5. Подключение C#-ядра — сделано: движок завендорен, Farseer замерен в лоб, детерминизм подтверждён
 
@@ -78,6 +78,7 @@ cd rust
 cargo build --release
 cargo test --all
 cargo run --release -p singularity-physics --bin bench
+cargo run --release -p singularity-net-transport --bin bench
 ```
 
 ```sh
