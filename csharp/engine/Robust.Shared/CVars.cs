@@ -1543,6 +1543,9 @@ namespace Robust.Shared
         public static readonly CVarDef<bool> AutoClearForces =
             CVarDef.Create("physics.autoclearforces", true);
 
+        public static readonly CVarDef<string> PhysicsBackend =
+            CVarDef.Create("physics.backend", "farseer", CVar.ARCHIVE | CVar.REPLICATED | CVar.SERVER);
+
         /// <summary>
         /// A velocity threshold for elastic collisions. Any collision with a relative linear
         /// velocity below this threshold will be treated as inelastic.

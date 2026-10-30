@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Prometheus;
 using Robust.Shared.Configuration;
 using Robust.Shared.Containers;
@@ -6,7 +7,9 @@ using Robust.Shared.GameObjects;
 using Robust.Shared.GameStates;
 using Robust.Shared.Map;
 using Robust.Shared.Map.Components;
+using Robust.Shared.Log;
 using Robust.Shared.Maths;
+using Robust.Shared.Physics.Backend;
 using Robust.Shared.Physics.Collision;
 using Robust.Shared.Physics.Components;
 using Robust.Shared.Physics.Events;
@@ -54,6 +57,10 @@ namespace Robust.Shared.Physics.Systems
         [Dependency] private CollisionWakeSystem _wakeSystem = default!;
 
         private int _substeps;
+
+        private IPhysicsBackend? _backend;
+
+        public string? PhysicsBackendName => _backend?.Name;
 
         /// <summary>
         /// A variation of <see cref="IGameTiming.CurTime"/> that takes into account the current physics sub-step.
@@ -117,6 +124,7 @@ namespace Robust.Shared.Physics.Systems
             Subs.CVar(_cfg, CVars.AutoClearForces, OnAutoClearChange, true);
             Subs.CVar(_cfg, CVars.NetTickrate, UpdateSubsteps, true);
             Subs.CVar(_cfg, CVars.TargetMinimumTickrate, UpdateSubsteps, true);
+            Subs.CVar(_cfg, CVars.PhysicsBackend, OnPhysicsBackendChange, true);
         }
 
         private void OnPhysicsShutdown(EntityUid uid, PhysicsComponent component, ComponentShutdown args)
@@ -152,6 +160,56 @@ namespace Robust.Shared.Physics.Systems
             var targetMinTickrate = (float) _cfg.GetCVar(CVars.TargetMinimumTickrate);
             var serverTickrate = (float) _cfg.GetCVar(CVars.NetTickrate);
             _substeps = (int)Math.Ceiling(targetMinTickrate / serverTickrate);
+        }
+
+        private void OnPhysicsBackendChange(string value)
+        {
+            var name = value.Trim().ToLowerInvariant();
+            IPhysicsBackend? next = null;
+            if (name == "rapier")
+            {
+                try
+                {
+                    next = new RapierPhysicsBackend(this, EntityManager);
+                }
+                catch (Exception e)
+                {
+                    Logger.Error($"physics backend '{name}' unavailable: {e.Message}");
+                }
+            }
+
+            if (next == _backend)
+                return;
+
+            _backend?.Shutdown();
+            _backend = next;
+        }
+
+        internal void BackendRaiseLocal<TEvent>(EntityUid uid, ref TEvent args, bool broadcast = false)
+            where TEvent : struct
+        {
+            RaiseLocalEvent(uid, ref args, broadcast);
+        }
+
+        internal bool BackendWriteVelocities(EntityUid uid, PhysicsComponent body, Vector2 linear, float angular)
+        {
+            var changed = false;
+            if (!body.LinearVelocity.EqualsApprox(linear, 0.0000001f))
+            {
+                body.LinearVelocity = linear;
+                changed = true;
+            }
+
+            if (MathF.Abs(body.AngularVelocity - angular) > 0.0000001f)
+            {
+                body.AngularVelocity = angular;
+                changed = true;
+            }
+
+            if (changed)
+                Dirty(uid, body);
+
+            return changed;
         }
 
         internal void OnParentChange(Entity<TransformComponent, MetaDataComponent> ent, EntityUid oldParent, EntityUid? oldMap)
@@ -233,6 +291,9 @@ namespace Robust.Shared.Physics.Systems
         {
             base.Shutdown();
 
+            _backend?.Shutdown();
+            _backend = null;
+
             ShutdownContacts();
         }
 
@@ -256,6 +317,43 @@ namespace Robust.Shared.Physics.Systems
         protected void SimulateWorld(float deltaTime, bool prediction)
         {
             var frameTime = deltaTime / _substeps;
+
+            if (_backend != null && !prediction)
+            {
+                EffectiveCurTime = _gameTiming.CurTime;
+                for (int i = 0; i < _substeps; i++)
+                {
+                    var updateBeforeSolve = new PhysicsUpdateBeforeSolveEvent(prediction, frameTime);
+                    using (_prof.Group("PreSolve", Color.Green))
+                    {
+                        RaiseLocalEvent(ref updateBeforeSolve);
+                    }
+
+                    using (_prof.Group("Solve", Color.Red))
+                    {
+                        _backend.Step(frameTime);
+                    }
+
+                    if (_autoClearForces)
+                        ClearForces();
+
+                    var updateAfterSolve = new PhysicsUpdateAfterSolveEvent(prediction, frameTime);
+                    using (_prof.Group("PostSolve", Color.Yellow))
+                    {
+                        RaiseLocalEvent(ref updateAfterSolve);
+                    }
+
+                    if (i == _substeps - 1)
+                    {
+                        FinalStep();
+                    }
+
+                    EffectiveCurTime = EffectiveCurTime.Value + TimeSpan.FromSeconds(frameTime);
+                }
+
+                EffectiveCurTime = null;
+                return;
+            }
 
             EffectiveCurTime = _gameTiming.CurTime;
             for (int i = 0; i < _substeps; i++)
