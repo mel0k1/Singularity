@@ -52,22 +52,22 @@ FFI-контракт: C# собирает реестры — типы компо
 | Путь | Язык | Роль |
 | --- | --- | --- |
 | `rust/crates/singularity-crypto` | Rust | кодек кадров XChaCha20-Poly1305, совместим с `NetEncryption` на уровне байтов |
-| `rust/crates/singularity-physics` · план | Rust | исследование бэкенда физики: Rapier/Avian против порта Farseer, за `IPhysicsBackend` |
+| `rust/crates/singularity-physics` | Rust | исследование бэкенда физики: Rapier и Avian за общим швом `PhysicsBackend`, с бенчмарком и матрицей паритета — см. [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-net-transport` · план | Rust | изучение совместимого с Lidgren транспорта |
 | `rust/crates/singularity-pvs` · план | Rust | SoA-данные видимости на сессию |
 | `csharp/` · план | C# | ядро оркестрации: ECS, IoC, сериализация, прототипы, GameStates — перенос архитектуры Robust Toolbox |
 
 ## Статус
 
-Фаза исследования завершена. Исходники Robust Toolbox изучены подсистема за подсистемой — ECS, IoC, сериализация, прототипы, GameStates/PVS, сеть, физика, нативные границы. Первый спайк, `singularity-crypto`, реализован и протестирован.
+Фаза исследования завершена. Исходники Robust Toolbox изучены подсистема за подсистемой — ECS, IoC, сериализация, прототипы, GameStates/PVS, сеть, физика, нативные границы. Два спайка реализованы, протестированы и замерены: `singularity-crypto` и `singularity-physics`.
 
 ## Дорожная карта
 
 1. `singularity-crypto` — сделано
-2. `singularity-physics` — бенчмарк Rapier/Avian против порта Farseer; замена только там, где профилирование докажет выгоду
+2. `singularity-physics` — исследование завершено: Rapier и Avian за нейтральным швом `PhysicsBackend`, детерминизм подтверждён двойным прогоном; Rapier быстрее по p50 в 3,7–5,0 раза, у Avian замечены пики 25 мс; замена отложена до профилирования на реальном контенте. Прямое сравнение с C#-портом Farseer ждёт C#-харнесс
 3. `singularity-net-transport` — сначала изучить проводной протокол форка Lidgren, не трогая ни байта
 4. `singularity-pvs` — SoA-данные сессий; pinned `PvsData` уже неуправляемые
-5. Подключение C#-ядра
+5. Подключение C#-ядра — открывает head-to-head бенчмарк с портом Farseer
 
 ## Сборка
 

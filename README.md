@@ -52,22 +52,22 @@ The FFI contract: C# builds the registries — component types, network ids, ser
 | Path | Language | Role |
 | --- | --- | --- |
 | `rust/crates/singularity-crypto` | Rust | XChaCha20-Poly1305 frame codec, wire-compatible with `NetEncryption` |
-| `rust/crates/singularity-physics` · planned | Rust | physics backend study: Rapier/Avian versus the Farseer port, behind `IPhysicsBackend` |
+| `rust/crates/singularity-physics` | Rust | physics backend study: Rapier and Avian behind a shared `PhysicsBackend` seam, benchmarked and parity-checked — see [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-net-transport` · planned | Rust | Lidgren-compatible transport study |
 | `rust/crates/singularity-pvs` · planned | Rust | SoA per-session visibility data |
 | `csharp/` · planned | C# | orchestration core: ECS, IoC, serialization, prototypes, GameStates — onboarded from the Robust Toolbox architecture |
 
 ## Status
 
-Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. The first spike, `singularity-crypto`, is implemented and tested.
+Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Two spikes are implemented, tested and benchmarked: `singularity-crypto` and `singularity-physics`.
 
 ## Roadmap
 
 1. `singularity-crypto` — done
-2. `singularity-physics` — benchmark Rapier/Avian against the Farseer port; swap only where profiling proves the win
+2. `singularity-physics` — study done: Rapier and Avian behind a neutral `PhysicsBackend` seam, deterministic under double-run hashing; Rapier leads p50 by 3.7–5.0x, Avian shows 25 ms spikes; swap deferred until profiling on real content. The head-to-head against the C# Farseer port awaits the C# harness
 3. `singularity-net-transport` — study the Lidgren fork wire protocol before touching a single byte of it
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
-5. C# core onboarding
+5. C# core onboarding — unlocks the Farseer-port head-to-head benchmark
 
 ## Building
 
