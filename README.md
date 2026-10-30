@@ -2,59 +2,85 @@
 
 # Singularity
 
-**A client-server game engine for multiplayer sandbox games, written in Rust on top of Bevy.**
+**A hybrid client-server game engine: a C# orchestration core with Rust subsystems.**
 
 [![CI](https://github.com/mel0k1/Singularity/actions/workflows/ci.yml/badge.svg)](https://github.com/mel0k1/Singularity/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-b7410e.svg)](https://www.rust-lang.org)
 
-A Rust reimagining of [Robust Toolbox](https://github.com/space-wizards/RobustToolbox), the engine behind Space Station 14.
+A reimagining of [Robust Toolbox](https://github.com/space-wizards/RobustToolbox), the engine behind Space Station 14.
 
 [English](README.md) · [Русский](README.ru.md)
 
 </div>
 
-## Why
+## Why hybrid
 
-Robust Toolbox spent a decade proving an unusual thesis: a fully authoritative server, delta-snapshot world replication with per-client visibility, client-side prediction and data-driven YAML content can carry a large multiplayer sandbox. Singularity keeps those ideas and rebuilds them in Rust.
+Rewriting Robust Toolbox in pure Rust would mean replacing ~367k lines of C#: `Robust.Shared` alone is 1073 files / ~165k lines. The content contract is welded to C#: reflection-based discovery plus four Roslyn source generators (`[DataField]`, `[AutoGenerateComponentState]`, `[SubscribeLocalEvent]`, `[Dependency]`) generate code directly into content assemblies. A full rewrite breaks every content project ever written against the engine.
 
-- **Authoritative server** — the client never decides anything gameplay-critical on its own
-- **Snapshot replication** — the world ships as delta snapshots with per-client potentially visible sets, not RPC soup
-- **Prediction and reconciliation** — input feels instant even at high latency
-- **Data-driven content** — entities, prototypes and maps are plain YAML
-- **Bevy inside** — ECS, scheduling, rendering, audio and input come from Bevy where they fit
+Singularity splits the engine along the seam Robust Toolbox already uses in production:
 
-## Crates
+- **C# stays the orchestrator** — ECS, IoC, YAML serialization, prototypes, GameStates/PVS orchestration, network messages. This is where the content contract lives, so it stays compatible.
+- **Rust becomes the native provider** — Robust Toolbox already ships native code behind C# interfaces (zstd, libsodium, SDL3, OpenAL). Singularity generalizes the pattern: performance-critical subsystems are Rust crates behind thin C# interfaces.
+- **One binary on both ends** — client and server share the same Rust artifact, so physics and crypto behave identically on both sides. Determinism first.
 
-| Crate | Role | Replaces (Robust Toolbox) |
+## Architecture
+
+```text
+C# layer — orchestration and content contract        Rust layer — crates behind C# interfaces
+══════════════════════════════════════════            ══════════════════════════════════════════
+GameObjects/ECS · IoC · entity event bus             singularity-crypto         XChaCha20-Poly1305 frames
+YAML serialization · prototypes                     singularity-physics        Rapier/Avian study
+GameStates · PVS orchestration                      singularity-net-transport  Lidgren wire study
+network messages · StringTable · discovery          singularity-pvs            SoA per-session data
+                        └──────────── FFI contract ──────────┘
+```
+
+The FFI contract: C# builds the registries — component types, network ids, serializer hashes — and hands them to Rust as tables. Rust never reflects; the registries always come from the C# host.
+
+## Wire compatibility
+
+`singularity-crypto` mirrors Robust Toolbox `NetEncryption` byte for byte:
+
+- frame = `[u64 LE counter][XChaCha20-Poly1305 ciphertext + tag]`, 24 bytes of overhead
+- the 24-byte XChaCha nonce is the counter in its first 8 bytes, zero elsewhere
+- counters are pre-incremented by two: the server transmits 2, 4, 6…, the client 3, 5, 7…, so the two directions never collide
+- authentication failure is a value, not an exception: `decrypt` returns `None`, like `TryDecrypt`; a corrupted frame cannot crash the peer
+
+## Layout
+
+| Path | Language | Role |
 | --- | --- | --- |
-| `singularity-core` | shared vocabulary: ticks, prototypes, serialization, event bus | `Robust.Shared` |
-| `singularity-server` | authoritative simulation, PVS snapshots, player sessions | `Robust.Server` |
-| `singularity-client` | rendering, input, UI, audio, prediction | `Robust.Client` |
+| `rust/crates/singularity-crypto` | Rust | XChaCha20-Poly1305 frame codec, wire-compatible with `NetEncryption` |
+| `rust/crates/singularity-physics` · planned | Rust | physics backend study: Rapier/Avian versus the Farseer port, behind `IPhysicsBackend` |
+| `rust/crates/singularity-net-transport` · planned | Rust | Lidgren-compatible transport study |
+| `rust/crates/singularity-pvs` · planned | Rust | SoA per-session visibility data |
+| `csharp/` · planned | C# | orchestration core: ECS, IoC, serialization, prototypes, GameStates — onboarded from the Robust Toolbox architecture |
 
 ## Status
 
-Research phase. The Robust Toolbox source, roughly 367k lines of C#, has been studied subsystem by subsystem and mapped onto Rust and Bevy primitives. No playable code yet.
+Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. The first spike, `singularity-crypto`, is implemented and tested.
 
 ## Roadmap
 
-1. Core vocabulary on Bevy ECS: ticks, network entity ids, prototypes, YAML serialization
-2. Server: fixed tick loop, snapshot protocol, per-client visibility
-3. Client: prediction, reconciliation, interpolation
-4. Rendering and input on top of `bevy_render`
-5. UI, audio, maps, tooling
+1. `singularity-crypto` — done
+2. `singularity-physics` — benchmark Rapier/Avian against the Farseer port; swap only where profiling proves the win
+3. `singularity-net-transport` — study the Lidgren fork wire protocol before touching a single byte of it
+4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
+5. C# core onboarding
 
 ## Building
 
 ```sh
+cd rust
 cargo build --release
 cargo test --all
 ```
 
 ## Code style
 
-The codebase is intentionally comment-free: names and structure carry all the meaning.
+The codebase is intentionally comment-free: names and structure carry all the meaning. CI rejects comments in sources. Commits are short.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). Singularity is an independent project inspired by [Robust Toolbox](https://github.com/space-wizards/RobustToolbox) by [space-wizards](https://github.com/space-wizards) and by [Bevy](https://bevyengine.org).
+Apache-2.0 — see [LICENSE](LICENSE). Singularity is an independent project inspired by [Robust Toolbox](https://github.com/space-wizards/RobustToolbox) (MIT) by [space-wizards](https://github.com/space-wizards) and by [Bevy](https://bevyengine.org) (MIT or Apache-2.0).
