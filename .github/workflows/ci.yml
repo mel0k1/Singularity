@@ -5,12 +5,31 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: comment-free sources
+        run: |
+          bad=$(grep -rEn '^[[:space:]]*(//|/\*)' --include='*.rs' --include='*.cs' rust csharp 2>/dev/null || true)
+          if [ -n "$bad" ]; then
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
   fmt:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,20 +39,30 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - run: cargo test --all
 
   build:
@@ -42,8 +71,26 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - run: cargo build --release --all
+
+  csharp:
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('csharp/**/*.csproj') != '' }}
+    defaults:
+      run:
+        working-directory: csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet build
