@@ -4,6 +4,7 @@ members = [
     "crates/singularity-crypto",
     "crates/singularity-physics",
     "crates/singularity-physics-ffi",
+    "crates/singularity-net-transport",
 ]
 
 [workspace.package]
@@ -15,3 +16,4 @@ repository = "https://github.com/mel0k1/Singularity"
 [workspace.dependencies]
 singularity-crypto = { path = "crates/singularity-crypto" }
 singularity-physics = { path = "crates/singularity-physics" }
+singularity-net-transport = { path = "crates/singularity-net-transport" }
