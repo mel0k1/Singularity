@@ -3,6 +3,7 @@ using System.Numerics;
 using Robust.Shared.GameObjects;
 using Robust.Shared.Map;
 using Robust.Shared.Physics;
+using Robust.Shared.Physics.Backend;
 using Robust.Shared.Physics.Collision.Shapes;
 using Robust.Shared.Physics.Components;
 using Robust.Shared.Physics.Events;
@@ -19,8 +20,21 @@ public enum SceneKind
     Mover,
 }
 
+public sealed record FfiStats(
+    double ApplyMicros,
+    double StepMicros,
+    double StatesMicros,
+    double EventsMicros,
+    long ApplyCalls,
+    long StepCalls,
+    long Commands,
+    long StatesCopied,
+    long EventsCopied,
+    long[] OpCounts);
+
 public sealed record Outcome(
     string Scene,
+    string Backend,
     int Ticks,
     int Bodies,
     int Dynamics,
@@ -29,7 +43,12 @@ public sealed record Outcome(
     ulong StateHash,
     float MinY,
     float CargoDx,
-    double[] TickUs);
+    double[] TickUs,
+    long AllocBytes,
+    int Gen0,
+    int Gen1,
+    int Gen2,
+    FfiStats? Ffi);
 
 public static class Scenes
 {
@@ -71,19 +90,27 @@ public static class Scenes
         };
     }
 
-    public static Outcome Run(SceneKind scene, int ticks)
+    public static Outcome Run(SceneKind scene, int ticks, string backend = "farseer")
     {
         var sim = RobustServerSimulation.NewSimulation()
-            .ChangeCVar(cfg => cfg.SetCVar("physics.target_minimum_tickrate", 30))
+            .ChangeCVar(cfg =>
+            {
+                cfg.SetCVar("physics.target_minimum_tickrate", 30);
+                cfg.SetCVar("physics.backend", backend);
+            })
             .RegisterEntitySystems(factory => factory.LoadExtraSystemType<ContactCounterSystem>())
             .InitializeInstance();
         var ent = sim.Resolve<IEntityManager>();
         var physics = ent.System<SharedPhysicsSystem>();
+        var activeBackend = physics.PhysicsBackendName;
+        if (backend != "farseer" && activeBackend != backend)
+            throw new InvalidOperationException($"physics backend '{backend}' did not activate (native library missing?)");
         var fixtures = ent.System<FixtureSystem>();
         var mapSys = ent.System<SharedMapSystem>();
         mapSys.CreateMap(out var mapId);
         physics.SetGravity(new Vector2(0f, -9.81f));
         ContactCounterSystem.Starts = 0;
+        RapierPhysicsMetrics.Reset();
 
         var rng = new Rng((ulong)Seed(scene));
         var ids = new List<EntityUid>();
@@ -146,6 +173,14 @@ public static class Scenes
             }
         }
 
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        var allocBefore = GC.GetAllocatedBytesForCurrentThread();
+        var gen0Before = GC.CollectionCount(0);
+        var gen1Before = GC.CollectionCount(1);
+        var gen2Before = GC.CollectionCount(2);
+
         var tickUs = new double[ticks];
         var watch = Stopwatch.StartNew();
         for (var t = 0; t < ticks; t++)
@@ -169,6 +204,11 @@ public static class Scenes
             watch.Stop();
             tickUs[t] = watch.Elapsed.TotalMicroseconds;
         }
+
+        var allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+        var gen0 = GC.CollectionCount(0) - gen0Before;
+        var gen1 = GC.CollectionCount(1) - gen1Before;
+        var gen2 = GC.CollectionCount(2) - gen2Before;
 
         var hash = Fnv.Basis;
         foreach (var id in ids)
@@ -208,7 +248,39 @@ public static class Scenes
             cargoDx = sum / cargo.Count;
         }
 
-        return new Outcome(Name(scene), ticks, ids.Count, dyn.Count, asleep, ContactCounterSystem.Starts / 2, hash, minY, cargoDx, tickUs);
+        FfiStats? ffi = null;
+        if (backend == "rapier")
+        {
+            ffi = new FfiStats(
+                RapierPhysicsMetrics.ApplyMicros,
+                RapierPhysicsMetrics.StepMicros,
+                RapierPhysicsMetrics.StatesMicros,
+                RapierPhysicsMetrics.EventsMicros,
+                RapierPhysicsMetrics.ApplyCalls,
+                RapierPhysicsMetrics.StepCalls,
+                RapierPhysicsMetrics.CommandsApplied,
+                RapierPhysicsMetrics.StatesCopied,
+                RapierPhysicsMetrics.EventsCopied,
+                (long[])RapierPhysicsMetrics.OpCounts.Clone());
+        }
+
+        return new Outcome(
+            Name(scene),
+            backend,
+            ticks,
+            ids.Count,
+            dyn.Count,
+            asleep,
+            ContactCounterSystem.Starts / 2,
+            hash,
+            minY,
+            cargoDx,
+            tickUs,
+            allocBytes,
+            gen0,
+            gen1,
+            gen2,
+            ffi);
     }
 
     public static List<string> Sanity(Outcome o)
