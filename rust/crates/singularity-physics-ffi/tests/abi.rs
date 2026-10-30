@@ -322,3 +322,519 @@ fn ffi_surface_end_to_end() {
         sg_world_destroy(world);
     }
 }
+
+fn add_body(world: &mut SgWorld, id: u64, kind: u64, x: f32, y: f32) {
+    world.apply(&[cmd(
+        OP_ADD_BODY,
+        id,
+        kind,
+        0,
+        [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )]);
+}
+
+struct JointSpec {
+    id: u64,
+    a: u64,
+    b: u64,
+    kind: u32,
+    anchor_a: [f32; 2],
+    anchor_b: [f32; 2],
+    collide_connected: bool,
+    enabled: bool,
+    breakpoint: f32,
+    params: [f32; 8],
+}
+
+fn add_joint(world: &mut SgWorld, spec: JointSpec) {
+    world.apply(&[
+        cmd(
+            OP_ADD_JOINT,
+            spec.id,
+            spec.a,
+            spec.b,
+            [
+                spec.anchor_a[0],
+                spec.anchor_a[1],
+                spec.anchor_b[0],
+                spec.anchor_b[1],
+                if spec.collide_connected { 1.0 } else { 0.0 },
+                if spec.enabled { 1.0 } else { 0.0 },
+                spec.breakpoint,
+                spec.kind as f32,
+            ],
+        ),
+        cmd(OP_SET_JOINT_PARAMS, spec.id, 0, 0, spec.params),
+    ]);
+}
+
+fn distance(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    ((ax - bx) * (ax - bx) + (ay - by) * (ay - by)).sqrt()
+}
+
+#[test]
+fn rigid_distance_joint_holds_gap() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_DYNAMIC, -1.0, 20.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 1.0, 20.0);
+    add_box_collider(&mut world, 10, 1, 0.4, 0.4, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.4, 0.4, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.4, 0.0],
+            anchor_b: [-0.4, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    assert_eq!(world.joint_count(), 1);
+    for _ in 0..240 {
+        world.step(DT);
+    }
+    let a = find_state(&world, 1);
+    let b = find_state(&world, 2);
+    let gap = distance(a.x, a.y, b.x, b.y);
+    assert!((gap - 2.0).abs() < 0.05, "gap drifted {gap}");
+}
+
+#[test]
+fn rope_joint_limits_distance() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_STATIC, 0.0, 0.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 1.5, -1.0);
+    add_box_collider(&mut world, 10, 1, 0.1, 0.1, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.4, 0.4, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.0, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    for _ in 0..240 {
+        world.step(DT);
+    }
+    let b = find_state(&world, 2);
+    let r = b.x * b.x + b.y * b.y;
+    assert!(r.sqrt() <= 2.05, "rope max violated {b:?}");
+    assert!(r.sqrt() >= 0.95, "rope min violated {b:?}");
+}
+
+#[test]
+fn spring_joint_settles_at_rest_length() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_STATIC, 0.0, 0.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 0.0, -3.0);
+    add_box_collider(&mut world, 10, 1, 0.1, 0.1, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.4, 0.4, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_SPRING,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.0, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [1.5, 20.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    for _ in 0..600 {
+        world.step(DT);
+    }
+    let b = find_state(&world, 2);
+    let r = (b.x * b.x + b.y * b.y).sqrt();
+    let equilibrium = 1.5 + 0.64 * 9.81 / 20.0;
+    assert!((r - equilibrium).abs() < 0.08, "spring rest {b:?}");
+}
+
+#[test]
+fn revolute_joint_keeps_attachment() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_STATIC, 0.0, 10.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 0.9, 10.0);
+    add_box_collider(&mut world, 10, 1, 0.1, 0.1, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.45, 0.45, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_REVOLUTE,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.9, 0.0],
+            collide_connected: false,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    for _ in 0..300 {
+        world.step(DT);
+    }
+    let b = find_state(&world, 2);
+    let d = distance(b.x, b.y, 0.0, 10.0);
+    assert!(d < 1.2, "pendulum detached {b:?}");
+    assert!(b.y < 10.0, "pendulum did not swing {b:?}");
+}
+
+#[test]
+fn revolute_motor_spins() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_STATIC, 0.0, 0.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 1.0, 0.0);
+    add_box_collider(&mut world, 10, 1, 0.1, 0.1, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.45, 0.45, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_REVOLUTE,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [1.0, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [0.0, 0.0, 0.0, JOINT_MOTOR_ENABLED, 4.0, 50.0, 0.0, 0.0],
+        },
+    );
+    let mut angle = 0.0f32;
+    for _ in 0..300 {
+        world.step(DT);
+        let b = find_state(&world, 2);
+        angle = b.x.atan2(b.y);
+    }
+    let spins = angle;
+    assert!(spins.abs() > 1.0, "motor did not spin {spins}");
+}
+
+#[test]
+fn weld_joint_holds_relative_angle() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_DYNAMIC, 0.0, 20.0);
+    world.apply(&[cmd(
+        OP_ADD_BODY,
+        2,
+        KIND_DYNAMIC,
+        0,
+        [
+            1.0,
+            20.0,
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    )]);
+    add_box_collider(&mut world, 10, 1, 0.4, 0.4, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.4, 0.4, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_WELD,
+            anchor_a: [0.4, 0.0],
+            anchor_b: [-0.4, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [
+                std::f32::consts::FRAC_PI_2,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+        },
+    );
+    for _ in 0..240 {
+        world.step(DT);
+    }
+    let a = find_state(&world, 1);
+    let b = find_state(&world, 2);
+    let relative = (b.angle - a.angle).rem_euclid(std::f32::consts::TAU);
+    let expected = std::f32::consts::FRAC_PI_2;
+    assert!(
+        (relative - expected).abs() < 0.1
+            || (relative - expected + std::f32::consts::TAU).abs() < 0.1,
+        "weld relative angle {relative}"
+    );
+}
+
+#[test]
+fn joint_break_emits_event_and_disables() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_STATIC, 0.0, 0.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 1.5, -0.5);
+    add_box_collider(&mut world, 10, 1, 0.1, 0.1, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.45, 0.45, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.0, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: 100.0,
+            params: [0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    let mut broken = false;
+    for _ in 0..120 {
+        world.step(DT);
+        let mut out = vec![SgJointEvent::default(); world.joint_event_count()];
+        let n = world.copy_joint_events(&mut out);
+        if n > 0 {
+            broken = true;
+            assert_eq!(out[0].id, 100);
+            assert!(out[0].impulse > 0.0);
+        }
+    }
+    assert!(broken, "joint never broke");
+    assert_eq!(world.joint_count(), 0);
+    let b = find_state(&world, 2);
+    assert!(b.y < -5.0, "broken joint still held {b:?}");
+
+    let mut stubborn = SgWorld::new();
+    add_body(&mut stubborn, 1, KIND_STATIC, 0.0, 0.0);
+    add_body(&mut stubborn, 2, KIND_DYNAMIC, 1.5, -0.5);
+    add_box_collider(&mut stubborn, 10, 1, 0.1, 0.1, 0.6);
+    add_box_collider(&mut stubborn, 11, 2, 0.45, 0.45, 0.6);
+    add_joint(
+        &mut stubborn,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.0, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    for _ in 0..120 {
+        stubborn.step(DT);
+        assert_eq!(stubborn.joint_event_count(), 0);
+    }
+    assert_eq!(stubborn.joint_count(), 1);
+}
+
+#[test]
+fn collide_connected_false_blocks_contacts() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_STATIC, 0.0, -0.55);
+    add_body(&mut world, 2, KIND_DYNAMIC, 0.0, 5.0);
+    add_box_collider(&mut world, 10, 1, 10.0, 0.5, 0.9);
+    add_box_collider(&mut world, 11, 2, 0.5, 0.5, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.0, 0.0],
+            collide_connected: false,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [50.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    let mut starts = 0u32;
+    for _ in 0..240 {
+        world.step(DT);
+        starts += events(&world).iter().filter(|e| e.started != 0).count() as u32;
+    }
+    assert_eq!(starts, 0, "contacts leaked through joint");
+    let b = find_state(&world, 2);
+    assert!(b.y < -20.0, "body did not fall through {b:?}");
+}
+
+extern "C" fn rejecting_filter(_ctx: *mut std::ffi::c_void, _a: u64, _b: u64) -> u32 {
+    0
+}
+
+static COUNTING_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn counting_filter(_ctx: *mut std::ffi::c_void, _a: u64, _b: u64) -> u32 {
+    COUNTING_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    1
+}
+
+#[test]
+fn pair_filter_rejects_and_caches() {
+    let mut world = drop_scene();
+    world.set_pair_filter(Some((rejecting_filter, std::ptr::null_mut())));
+    for _ in 0..120 {
+        world.step(DT);
+    }
+    assert_eq!(events(&world).len(), 0);
+    let body = find_state(&world, 2);
+    assert!(body.y < -10.0, "filter did not reject floor {body:?}");
+    assert!(world.filter_calls() > 0);
+    assert!(world.cache_hits() >= world.filter_calls());
+
+    world.set_pair_filter(None);
+    let mut world_b = drop_scene();
+    for _ in 0..240 {
+        world_b.step(DT);
+    }
+    let body = find_state(&world_b, 2);
+    assert!(
+        (body.y - 0.45).abs() < 0.05,
+        "no-filter scene broken {body:?}"
+    );
+}
+
+#[test]
+fn joint_add_invalidates_pair_cache() {
+    let mut world = drop_scene();
+    COUNTING_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    world.set_pair_filter(Some((counting_filter, std::ptr::null_mut())));
+    for _ in 0..240 {
+        world.step(DT);
+    }
+    let body = find_state(&world, 2);
+    assert!(
+        (body.y - 0.45).abs() < 0.05,
+        "counting filter broke rest {body:?}"
+    );
+    let calls_before = COUNTING_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(calls_before > 0);
+
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.0, 0.0],
+            anchor_b: [0.0, 0.0],
+            collide_connected: false,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [50.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    let mut stopped = false;
+    for _ in 0..240 {
+        world.step(DT);
+        stopped |= events(&world).iter().any(|e| e.started == 0);
+    }
+    assert!(stopped, "joint did not end the cached contact");
+    let body = find_state(&world, 2);
+    assert!(body.y < -20.0, "joint blocking not applied {body:?}");
+    let calls_after = COUNTING_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(calls_after >= calls_before, "no re-evaluation happened");
+}
+
+#[test]
+fn sleep_disabled_body_never_sleeps() {
+    let mut world = drop_scene();
+    world.apply(&[cmd(
+        OP_SET_SLEEP,
+        2,
+        0,
+        0,
+        [0.2, 0.01, 0.005, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )]);
+    for _ in 0..600 {
+        world.step(DT);
+    }
+    let body = find_state(&world, 2);
+    assert_eq!(body.flags & FLAG_ASLEEP, 0, "body slept despite disallow");
+    assert!((body.y - 0.45).abs() < 0.05, "body not resting {body:?}");
+}
+
+#[test]
+fn sleep_time_until_sleep_delays() {
+    let mut slow = drop_scene();
+    slow.set_sleep(2.0, 0.01, 0.005);
+    for _ in 0..60 {
+        slow.step(DT);
+    }
+    let body = find_state(&slow, 2);
+    assert_eq!(body.flags & FLAG_ASLEEP, 0, "slept before time_until_sleep");
+
+    let mut fast = drop_scene();
+    fast.set_sleep(0.05, 0.05, 0.5);
+    let mut slept_by = None;
+    for t in 0..240 {
+        fast.step(DT);
+        if find_state(&fast, 2).flags & FLAG_ASLEEP != 0 {
+            slept_by = Some(t);
+            break;
+        }
+    }
+    assert!(slept_by.is_some(), "never slept fast");
+}
+
+#[test]
+fn removed_joint_releases_bodies() {
+    let mut world = SgWorld::new();
+    add_body(&mut world, 1, KIND_DYNAMIC, -1.0, 20.0);
+    add_body(&mut world, 2, KIND_DYNAMIC, 1.0, 20.0);
+    add_box_collider(&mut world, 10, 1, 0.4, 0.4, 0.6);
+    add_box_collider(&mut world, 11, 2, 0.4, 0.4, 0.6);
+    add_joint(
+        &mut world,
+        JointSpec {
+            id: 100,
+            a: 1,
+            b: 2,
+            kind: JOINT_DISTANCE_RIGID,
+            anchor_a: [0.4, 0.0],
+            anchor_b: [-0.4, 0.0],
+            collide_connected: true,
+            enabled: true,
+            breakpoint: f32::MAX,
+            params: [2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    );
+    world.apply(&[cmd(OP_REMOVE_JOINT, 100, 0, 0, [0.0; 8])]);
+    assert_eq!(world.joint_count(), 0);
+    for _ in 0..60 {
+        world.step(DT);
+    }
+    let a = find_state(&world, 1);
+    let b = find_state(&world, 2);
+    assert!((a.y - 20.0).abs() > 1.0, "bodies did not fall freely {a:?}");
+    assert!((a.y - b.y).abs() < 0.01, "bodies diverged without a joint");
+}

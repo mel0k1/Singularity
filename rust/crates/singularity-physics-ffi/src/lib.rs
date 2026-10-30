@@ -1,11 +1,14 @@
 #![allow(clippy::missing_safety_doc)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Mutex;
 
+use rapier2d::dynamics::JointAxis;
 use rapier2d::prelude::*;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 pub const KIND_DYNAMIC: u64 = 0;
 pub const KIND_STATIC: u64 = 1;
@@ -25,8 +28,23 @@ pub const OP_SET_FIXED_ROTATION: u32 = 11;
 pub const OP_SET_AWAKE: u32 = 12;
 pub const OP_SET_GRAVITY: u32 = 13;
 pub const OP_SET_FORCE: u32 = 14;
+pub const OP_ADD_JOINT: u32 = 15;
+pub const OP_REMOVE_JOINT: u32 = 16;
+pub const OP_SET_SLEEP: u32 = 17;
+pub const OP_SET_JOINT_PARAMS: u32 = 18;
+
+pub const JOINT_DISTANCE_RIGID: u32 = 0;
+pub const JOINT_DISTANCE_SPRING: u32 = 1;
+pub const JOINT_REVOLUTE: u32 = 2;
+pub const JOINT_PRISMATIC: u32 = 3;
+pub const JOINT_WELD: u32 = 4;
+
+pub const JOINT_LIMIT_ENABLED: f32 = 1.0;
+pub const JOINT_MOTOR_ENABLED: f32 = 2.0;
 
 pub const FLAG_ASLEEP: u32 = 1;
+
+pub type PairFilterFn = extern "C" fn(ctx: *mut c_void, a: u64, b: u64) -> u32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +86,43 @@ pub struct SgContactEvent {
     pub p1y: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SgJointEvent {
+    pub id: u64,
+    pub impulse: f32,
+    pub reserved: u32,
+    pub reserved2: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SleepConfig {
+    time_until_sleep: f32,
+    linear_threshold: f32,
+    angular_threshold: f32,
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        SleepConfig {
+            time_until_sleep: 0.5,
+            linear_threshold: 0.05,
+            angular_threshold: 0.5,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MirroredJoint {
+    handle: ImpulseJointHandle,
+    body_a: u64,
+    body_b: u64,
+    kind: u32,
+    enabled: bool,
+    collide_connected: bool,
+    breakpoint: f32,
+}
+
 struct RawEvent {
     a: ColliderHandle,
     b: ColliderHandle,
@@ -107,16 +162,128 @@ impl EventHandler for EventCollector {
     fn handle_soft_body_tear_event(&self, _soft_bodies: &SoftBodySet, _event: &SoftBodyTearEvent) {}
 }
 
+struct FilterCtx(*mut c_void);
+
+impl Copy for FilterCtx {}
+
+impl Clone for FilterCtx {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+struct PairFilterState {
+    handle_collider: HashMap<ColliderHandle, u64>,
+    collider_body: HashMap<u64, u64>,
+    joints: HashMap<u64, MirroredJoint>,
+    callback: Option<(PairFilterFn, FilterCtx)>,
+    cache: RefCell<HashMap<(u64, u64), bool>>,
+    filter_calls: Cell<u64>,
+    cache_hits: Cell<u64>,
+}
+
+impl Default for PairFilterState {
+    fn default() -> Self {
+        PairFilterState {
+            handle_collider: HashMap::new(),
+            collider_body: HashMap::new(),
+            joints: HashMap::new(),
+            callback: None,
+            cache: RefCell::new(HashMap::new()),
+            filter_calls: Cell::new(0),
+            cache_hits: Cell::new(0),
+        }
+    }
+}
+
+struct SgHooks<'a> {
+    state: &'a PairFilterState,
+}
+
+impl SgHooks<'_> {
+    fn allow_pair(&self, collider_a: ColliderHandle, collider_b: ColliderHandle) -> bool {
+        let Some(id_a) = self.state.handle_collider.get(&collider_a).copied() else {
+            return true;
+        };
+        let Some(id_b) = self.state.handle_collider.get(&collider_b).copied() else {
+            return true;
+        };
+        let key = if id_a < id_b {
+            (id_a, id_b)
+        } else {
+            (id_b, id_a)
+        };
+        let cache = self.state.cache.borrow();
+        if let Some(cached) = cache.get(&key) {
+            self.state.cache_hits.set(self.state.cache_hits.get() + 1);
+            return *cached;
+        }
+        drop(cache);
+        let blocked = self.joint_blocks_pair(id_a, id_b);
+        let allowed = if blocked {
+            false
+        } else {
+            match self.state.callback {
+                Some((filter, ctx)) => {
+                    self.state
+                        .filter_calls
+                        .set(self.state.filter_calls.get() + 1);
+                    filter(ctx.0, id_a, id_b) != 0
+                }
+                None => true,
+            }
+        };
+        self.state.cache.borrow_mut().insert(key, allowed);
+        allowed
+    }
+
+    fn joint_blocks_pair(&self, id_a: u64, id_b: u64) -> bool {
+        let Some(body_a) = self.state.collider_body.get(&id_a) else {
+            return false;
+        };
+        let Some(body_b) = self.state.collider_body.get(&id_b) else {
+            return false;
+        };
+        if body_a == body_b {
+            return true;
+        }
+        self.state.joints.values().any(|joint| {
+            joint.enabled
+                && !joint.collide_connected
+                && ((joint.body_a == *body_a && joint.body_b == *body_b)
+                    || (joint.body_a == *body_b && joint.body_b == *body_a))
+        })
+    }
+}
+
+impl PhysicsHooks for SgHooks<'_> {
+    fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
+        if self.allow_pair(context.collider1, context.collider2) {
+            Some(SolverFlags::COMPUTE_RIGID_IMPULSES)
+        } else {
+            None
+        }
+    }
+
+    fn filter_intersection_pair(&self, context: &PairFilterContext) -> bool {
+        self.allow_pair(context.collider1, context.collider2)
+    }
+
+    fn modify_solver_contacts(&self, _context: &mut ContactModificationContext) {}
+}
+
 pub struct SgWorld {
     physics: PhysicsWorld,
     collector: EventCollector,
+    filter: PairFilterState,
     body_handles: HashMap<u64, RigidBodyHandle>,
     body_order: Vec<u64>,
     collider_handles: HashMap<u64, ColliderHandle>,
-    collider_body: HashMap<u64, u64>,
-    handle_collider: HashMap<ColliderHandle, u64>,
     vertices: Vec<f32>,
     events: Vec<SgContactEvent>,
+    joint_events: Vec<SgJointEvent>,
+    sleep_config: SleepConfig,
+    last_dt: f32,
 }
 
 impl Default for SgWorld {
@@ -132,13 +299,15 @@ impl SgWorld {
         SgWorld {
             physics,
             collector: EventCollector::default(),
+            filter: PairFilterState::default(),
             body_handles: HashMap::new(),
             body_order: Vec::new(),
             collider_handles: HashMap::new(),
-            collider_body: HashMap::new(),
-            handle_collider: HashMap::new(),
             vertices: Vec::new(),
             events: Vec::new(),
+            joint_events: Vec::new(),
+            sleep_config: SleepConfig::default(),
+            last_dt: 1.0 / 60.0,
         }
     }
 
@@ -147,17 +316,138 @@ impl SgWorld {
         self.vertices.extend_from_slice(data);
     }
 
+    pub fn set_pair_filter(&mut self, filter: Option<(PairFilterFn, *mut c_void)>) {
+        self.filter.callback = filter.map(|(f, ctx)| (f, FilterCtx(ctx)));
+        self.filter.cache.borrow_mut().clear();
+    }
+
+    pub fn set_sleep(
+        &mut self,
+        time_until_sleep: f32,
+        linear_threshold: f32,
+        angular_threshold: f32,
+    ) {
+        self.sleep_config = SleepConfig {
+            time_until_sleep,
+            linear_threshold,
+            angular_threshold,
+        };
+        let handles: Vec<RigidBodyHandle> = self.body_handles.values().copied().collect();
+        for handle in handles {
+            self.apply_sleep(handle);
+        }
+    }
+
+    fn apply_sleep(&mut self, handle: RigidBodyHandle) {
+        let config = self.sleep_config;
+        if let Some(body) = self.physics.bodies.get_mut(handle) {
+            let activation = body.activation_mut();
+            activation.time_until_sleep = config.time_until_sleep;
+            activation.normalized_linear_threshold = config.linear_threshold;
+            activation.angular_threshold = config.angular_threshold;
+        }
+    }
+
+    fn set_body_sleep_allowed(&mut self, id: u64, allowed: bool) {
+        let Some(handle) = self.body_handles.get(&id).copied() else {
+            return;
+        };
+        if let Some(body) = self.physics.bodies.get_mut(handle) {
+            if allowed {
+                let config = self.sleep_config;
+                let activation = body.activation_mut();
+                activation.time_until_sleep = config.time_until_sleep;
+                activation.normalized_linear_threshold = config.linear_threshold;
+                activation.angular_threshold = config.angular_threshold;
+            } else {
+                let activation = body.activation_mut();
+                activation.normalized_linear_threshold = -1.0;
+                activation.angular_threshold = -1.0;
+            }
+        }
+    }
+
+    fn clear_pair_cache_for(&mut self, body_a: u64, body_b: u64) {
+        let mut drop_keys = Vec::new();
+        for (collider, body) in &self.filter.collider_body {
+            if *body != body_a && *body != body_b {
+                continue;
+            }
+            for (other, other_body) in &self.filter.collider_body {
+                if *other_body != body_a && *other_body != body_b {
+                    continue;
+                }
+                let key = if collider < other {
+                    (*collider, *other)
+                } else {
+                    (*other, *collider)
+                };
+                drop_keys.push(key);
+            }
+        }
+        for key in drop_keys {
+            self.filter.cache.borrow_mut().remove(&key);
+        }
+    }
+
     pub fn apply(&mut self, commands: &[SgCommand]) -> u32 {
         let mut consumed = 0u32;
-        for cmd in commands {
-            consumed += 1;
+        let mut i = 0usize;
+        while i < commands.len() {
+            let cmd = commands[i];
             match cmd.op {
-                OP_ADD_BODY => self.add_body(cmd),
-                OP_REMOVE_BODY => self.remove_body(cmd.id),
-                OP_ADD_COLLIDER_BOX | OP_ADD_COLLIDER_CIRCLE | OP_ADD_COLLIDER_POLY => {
-                    self.add_collider(cmd)
+                OP_ADD_JOINT => {
+                    let params = commands
+                        .get(i + 1)
+                        .filter(|next| next.op == OP_SET_JOINT_PARAMS && next.id == cmd.id)
+                        .map(|next| next.p);
+                    if let Some(params) = params {
+                        self.add_joint(&cmd, &params);
+                        i += 2;
+                        consumed += 2;
+                    } else {
+                        i += 1;
+                        consumed += 1;
+                    }
                 }
-                OP_REMOVE_COLLIDER => self.remove_collider(cmd.id),
+                OP_SET_JOINT_PARAMS => {
+                    i += 1;
+                    consumed += 1;
+                }
+                OP_REMOVE_JOINT => {
+                    self.remove_joint(cmd.id);
+                    i += 1;
+                    consumed += 1;
+                }
+                OP_SET_SLEEP => {
+                    if cmd.id == 0 {
+                        self.set_sleep(cmd.p[0], cmd.p[1], cmd.p[2]);
+                    } else {
+                        self.set_body_sleep_allowed(cmd.id, cmd.p[3] != 0.0);
+                    }
+                    i += 1;
+                    consumed += 1;
+                }
+                OP_ADD_BODY => {
+                    self.add_body(&cmd);
+                    i += 1;
+                    consumed += 1;
+                }
+                OP_REMOVE_BODY => {
+                    self.remove_body(cmd.id);
+                    i += 1;
+                    consumed += 1;
+                }
+                OP_ADD_COLLIDER_BOX | OP_ADD_COLLIDER_CIRCLE | OP_ADD_COLLIDER_POLY => {
+                    self.add_collider(&cmd);
+                    i += 1;
+                    consumed += 1;
+                }
+                OP_REMOVE_COLLIDER => {
+                    self.remove_collider(cmd.id);
+                    i += 1;
+                    consumed += 1;
+                }
                 OP_SET_TRANSFORM => {
                     if let Some(body) = self.body_mut(cmd.id) {
                         body.set_position(
@@ -165,6 +455,8 @@ impl SgWorld {
                             cmd.p[3] != 0.0,
                         );
                     }
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_VELOCITY => {
                     if let Some(body) = self.body_mut(cmd.id) {
@@ -175,22 +467,30 @@ impl SgWorld {
                         body.set_linvel(linvel, wake);
                         body.set_angvel(cmd.p[2], wake);
                     }
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_BODY_KIND => {
                     if let Some(body) = self.body_mut(cmd.id) {
                         body.set_body_type(kind_of(cmd.id2), true);
                     }
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_DAMPING => {
                     if let Some(body) = self.body_mut(cmd.id) {
                         body.set_linear_damping(cmd.p[0]);
                         body.set_angular_damping(cmd.p[1]);
                     }
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_FIXED_ROTATION => {
                     if let Some(body) = self.body_mut(cmd.id) {
                         body.set_enabled_rotations(true, true, cmd.id2 == 0, true);
                     }
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_AWAKE => {
                     if let Some(body) = self.body_mut(cmd.id) {
@@ -200,9 +500,13 @@ impl SgWorld {
                             body.sleep();
                         }
                     }
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_GRAVITY => {
                     self.physics.gravity = Vector::new(cmd.p[0], cmd.p[1]);
+                    i += 1;
+                    consumed += 1;
                 }
                 OP_SET_FORCE => {
                     if let Some(body) = self.body_mut(cmd.id) {
@@ -215,8 +519,13 @@ impl SgWorld {
                             body.add_torque(cmd.p[2], false);
                         }
                     }
+                    i += 1;
+                    consumed += 1;
                 }
-                _ => {}
+                _ => {
+                    i += 1;
+                    consumed += 1;
+                }
             }
         }
         consumed
@@ -224,15 +533,21 @@ impl SgWorld {
 
     pub fn step(&mut self, dt: f32) {
         self.physics.integration_parameters.dt = dt;
+        self.last_dt = dt;
         self.collector.raw.lock().unwrap().clear();
-        self.physics.step_with_events(&(), &self.collector);
+        {
+            let hooks = SgHooks {
+                state: &self.filter,
+            };
+            self.physics.step_with_events(&hooks, &self.collector);
+        }
         let raw = std::mem::take(&mut *self.collector.raw.lock().unwrap());
         self.events.clear();
         for e in raw {
-            let Some(cid_a) = self.handle_collider.get(&e.a).copied() else {
+            let Some(cid_a) = self.filter.handle_collider.get(&e.a).copied() else {
                 continue;
             };
-            let Some(cid_b) = self.handle_collider.get(&e.b).copied() else {
+            let Some(cid_b) = self.filter.handle_collider.get(&e.b).copied() else {
                 continue;
             };
             let mut event = SgContactEvent {
@@ -251,6 +566,50 @@ impl SgWorld {
                 self.fill_manifold(e.a, e.b, &mut event);
             }
             self.events.push(event);
+        }
+        self.collect_joint_breaks();
+    }
+
+    fn collect_joint_breaks(&mut self) {
+        self.joint_events.clear();
+        if self.filter.joints.is_empty() {
+            return;
+        }
+        let dt = if self.last_dt > 0.0 {
+            self.last_dt
+        } else {
+            1.0 / 60.0
+        };
+        let inv_dt = 1.0 / dt;
+        let iterations = self
+            .physics
+            .integration_parameters
+            .num_solver_iterations
+            .max(1) as f32;
+        let mut broken: Vec<u64> = Vec::new();
+        for (id, joint) in &self.filter.joints {
+            if !joint.enabled || joint.breakpoint == f32::MAX || joint.breakpoint <= 0.0 {
+                continue;
+            }
+            let Some(impulse_joint) = self.physics.impulse_joints.get(joint.handle) else {
+                continue;
+            };
+            let impulse = joint_force_magnitude(impulse_joint) * inv_dt * iterations;
+            if impulse * impulse > joint.breakpoint * joint.breakpoint {
+                self.joint_events.push(SgJointEvent {
+                    id: *id,
+                    impulse,
+                    reserved: 0,
+                    reserved2: 0,
+                });
+                broken.push(*id);
+            }
+        }
+        for id in broken {
+            if let Some(joint) = self.filter.joints.get_mut(&id) {
+                self.physics.impulse_joints.remove(joint.handle, true);
+                joint.enabled = false;
+            }
         }
     }
 
@@ -295,6 +654,47 @@ impl SgWorld {
         let n = self.events.len().min(out.len());
         out[..n].copy_from_slice(&self.events[..n]);
         n
+    }
+
+    pub fn joint_event_count(&self) -> usize {
+        self.joint_events.len()
+    }
+
+    pub fn copy_joint_events(&self, out: &mut [SgJointEvent]) -> usize {
+        let n = self.joint_events.len().min(out.len());
+        out[..n].copy_from_slice(&self.joint_events[..n]);
+        n
+    }
+
+    pub fn joint_count(&self) -> usize {
+        self.filter.joints.values().filter(|j| j.enabled).count()
+    }
+
+    pub fn joint_impulse(&self, id: u64) -> f32 {
+        let Some(joint) = self.filter.joints.get(&id) else {
+            return 0.0;
+        };
+        let Some(impulse_joint) = self.physics.impulse_joints.get(joint.handle) else {
+            return 0.0;
+        };
+        let dt = if self.last_dt > 0.0 {
+            self.last_dt
+        } else {
+            1.0 / 60.0
+        };
+        let iterations = self
+            .physics
+            .integration_parameters
+            .num_solver_iterations
+            .max(1) as f32;
+        joint_force_magnitude(impulse_joint) / dt * iterations
+    }
+    pub fn filter_calls(&self) -> u64 {
+        self.filter.filter_calls.get()
+    }
+
+    pub fn cache_hits(&self) -> u64 {
+        self.filter.cache_hits.get()
     }
 
     fn fill_manifold(
@@ -343,6 +743,13 @@ impl SgWorld {
             .translation(Vector::new(cmd.p[0], cmd.p[1]))
             .rotation(cmd.p[2]);
         let handle = self.physics.insert_body(builder);
+        let config = self.sleep_config;
+        if let Some(body) = self.physics.bodies.get_mut(handle) {
+            let activation = body.activation_mut();
+            activation.time_until_sleep = config.time_until_sleep;
+            activation.normalized_linear_threshold = config.linear_threshold;
+            activation.angular_threshold = config.angular_threshold;
+        }
         self.body_handles.insert(cmd.id, handle);
         self.body_order.push(cmd.id);
     }
@@ -351,9 +758,11 @@ impl SgWorld {
         let Some(handle) = self.body_handles.remove(&id) else {
             return;
         };
+        self.remove_joints_for_body(id);
         self.physics.remove_body_with_colliders(handle, true);
         self.body_order.retain(|other| *other != id);
         let stale: Vec<u64> = self
+            .filter
             .collider_body
             .iter()
             .filter(|(_, body)| **body == id)
@@ -361,6 +770,71 @@ impl SgWorld {
             .collect();
         for cid in stale {
             self.forget_collider(cid);
+        }
+    }
+
+    fn add_joint(&mut self, cmd: &SgCommand, params: &[f32; 8]) {
+        self.remove_joint(cmd.id);
+        let joint = MirroredJoint {
+            handle: ImpulseJointHandle::invalid(),
+            body_a: cmd.id2,
+            body_b: cmd.id3,
+            kind: cmd.p[7] as u32,
+            enabled: cmd.p[5] != 0.0,
+            collide_connected: cmd.p[4] != 0.0,
+            breakpoint: cmd.p[6],
+        };
+        self.filter.joints.insert(cmd.id, joint);
+        if !joint.enabled {
+            return;
+        }
+        let Some(handle_a) = self.body_handles.get(&cmd.id2).copied() else {
+            return;
+        };
+        let Some(handle_b) = self.body_handles.get(&cmd.id3).copied() else {
+            return;
+        };
+        let anchor_a = Vector::new(cmd.p[0], cmd.p[1]);
+        let anchor_b = Vector::new(cmd.p[2], cmd.p[3]);
+        let Some(joint_params) = build_joint(
+            joint.kind,
+            anchor_a,
+            anchor_b,
+            joint.collide_connected,
+            params,
+        ) else {
+            return;
+        };
+        let handle = self
+            .physics
+            .impulse_joints
+            .insert(handle_a, handle_b, joint_params, true);
+        if let Some(stored) = self.filter.joints.get_mut(&cmd.id) {
+            stored.handle = handle;
+        }
+        self.clear_pair_cache_for(cmd.id2, cmd.id3);
+    }
+
+    fn remove_joint(&mut self, id: u64) {
+        let Some(joint) = self.filter.joints.remove(&id) else {
+            return;
+        };
+        if joint.handle != ImpulseJointHandle::invalid() {
+            self.physics.impulse_joints.remove(joint.handle, true);
+        }
+        self.clear_pair_cache_for(joint.body_a, joint.body_b);
+    }
+
+    fn remove_joints_for_body(&mut self, body: u64) {
+        let stale: Vec<u64> = self
+            .filter
+            .joints
+            .iter()
+            .filter(|(_, joint)| joint.body_a == body || joint.body_b == body)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.remove_joint(id);
         }
     }
 
@@ -410,13 +884,16 @@ impl SgWorld {
             .collision_groups(InteractionGroups::new(
                 Group::from_bits_retain((cmd.id3 >> 32) as u32),
                 Group::from_bits_retain(cmd.id3 as u32),
-                InteractionTestMode::And,
+                InteractionTestMode::Or,
             ))
-            .active_events(ActiveEvents::COLLISION_EVENTS);
+            .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_hooks(
+                ActiveHooks::FILTER_CONTACT_PAIRS | ActiveHooks::FILTER_INTERSECTION_PAIR,
+            );
         let handle = self.physics.insert_collider(builder, Some(parent));
         self.collider_handles.insert(cmd.id, handle);
-        self.collider_body.insert(cmd.id, cmd.id2);
-        self.handle_collider.insert(handle, cmd.id);
+        self.filter.collider_body.insert(cmd.id, cmd.id2);
+        self.filter.handle_collider.insert(handle, cmd.id);
     }
 
     fn remove_collider(&mut self, id: u64) {
@@ -428,16 +905,110 @@ impl SgWorld {
     }
 
     fn forget_collider(&mut self, id: u64) {
-        self.collider_body.remove(&id);
+        self.filter.collider_body.remove(&id);
         if let Some(handle) = self.collider_handles.remove(&id) {
-            self.handle_collider.remove(&handle);
+            self.filter.handle_collider.remove(&handle);
         }
+        self.filter
+            .cache
+            .borrow_mut()
+            .retain(|(a, b), _| *a != id && *b != id);
     }
 
     fn body_mut(&mut self, id: u64) -> Option<&mut RigidBody> {
         let handle = self.body_handles.get(&id).copied()?;
         self.physics.bodies.get_mut(handle)
     }
+}
+
+fn build_joint(
+    kind: u32,
+    anchor_a: Vector,
+    anchor_b: Vector,
+    collide_connected: bool,
+    params: &[f32; 8],
+) -> Option<GenericJoint> {
+    match kind {
+        JOINT_DISTANCE_RIGID => {
+            let min = params[0].max(0.0);
+            let max = params[1].max(min);
+            let mut joint = RopeJoint::new(max);
+            joint.set_local_anchor1(anchor_a);
+            joint.set_local_anchor2(anchor_b);
+            joint.set_contacts_enabled(collide_connected);
+            joint.data.set_limits(JointAxis::LinX, [min, max]);
+            Some(joint.into())
+        }
+        JOINT_DISTANCE_SPRING => {
+            if params[1] <= 0.0 {
+                let rest = params[0].max(0.0);
+                let mut joint = RopeJoint::new(rest);
+                joint.set_local_anchor1(anchor_a);
+                joint.set_local_anchor2(anchor_b);
+                joint.set_contacts_enabled(collide_connected);
+                joint.data.set_limits(JointAxis::LinX, [rest, rest]);
+                return Some(joint.into());
+            }
+            let mut joint = SpringJoint::new(params[0].max(0.0), params[1], params[2]);
+            joint.set_local_anchor1(anchor_a);
+            joint.set_local_anchor2(anchor_b);
+            joint.set_contacts_enabled(collide_connected);
+            Some(joint.into())
+        }
+        JOINT_REVOLUTE => {
+            let mut joint = RevoluteJoint::new();
+            joint.set_local_anchor1(anchor_a);
+            joint.set_local_anchor2(anchor_b);
+            joint.set_contacts_enabled(collide_connected);
+            let reference = params[0];
+            joint.data.local_frame2.rotation = Rotation::new(-reference);
+            if params[3] != 0.0 {
+                joint.set_limits([params[1], params[2]]);
+            }
+            if params[3] >= JOINT_MOTOR_ENABLED {
+                joint.set_motor_model(MotorModel::ForceBased);
+                joint.set_motor_velocity(params[4], 1.0);
+                joint.set_motor_max_force(params[5]);
+            }
+            Some(joint.into())
+        }
+        JOINT_PRISMATIC => {
+            let mut joint = PrismaticJoint::new(Vector::new(params[0], params[1]));
+            joint.set_local_anchor1(anchor_a);
+            joint.set_local_anchor2(anchor_b);
+            joint.set_contacts_enabled(collide_connected);
+            let reference = params[2];
+            joint.data.local_frame2.rotation = Rotation::new(-reference);
+            if params[5] != 0.0 {
+                joint.set_limits([params[3], params[4]]);
+            }
+            if params[5] >= JOINT_MOTOR_ENABLED {
+                joint.set_motor_model(MotorModel::ForceBased);
+                joint.set_motor_velocity(params[6], 1.0);
+                joint.set_motor_max_force(params[7]);
+            }
+            Some(joint.into())
+        }
+        JOINT_WELD => {
+            let mut joint = FixedJoint::new();
+            joint.set_local_frame1(Pose2::new(anchor_a, 0.0));
+            joint.set_local_frame2(Pose2::new(anchor_b, -params[0]));
+            joint.set_contacts_enabled(collide_connected);
+            Some(joint.into())
+        }
+        _ => None,
+    }
+}
+
+fn joint_force_magnitude(joint: &ImpulseJoint) -> f32 {
+    let mut sum = joint.impulses.length_squared();
+    for limits in &joint.data.limits {
+        sum += limits.impulse * limits.impulse;
+    }
+    for motor in &joint.data.motors {
+        sum += motor.impulse * motor.impulse;
+    }
+    sum.sqrt()
 }
 
 fn kind_builder(kind: u64) -> RigidBodyBuilder {
@@ -494,6 +1065,32 @@ pub unsafe extern "C" fn sg_world_set_vertices(
     let slice = unsafe { std::slice::from_raw_parts(data, count) };
     world.set_vertices(slice);
     count as u32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_world_set_pair_filter(
+    world: *mut SgWorld,
+    filter: Option<PairFilterFn>,
+    ctx: *mut c_void,
+) {
+    if world.is_null() {
+        return;
+    }
+    let world = unsafe { &mut *world };
+    world.set_pair_filter(filter.map(|f| (f, ctx)));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_world_set_sleep(
+    world: *mut SgWorld,
+    time_until_sleep: f32,
+    linear_threshold: f32,
+    angular_threshold: f32,
+) {
+    if world.is_null() {
+        return;
+    }
+    unsafe { (*world).set_sleep(time_until_sleep, linear_threshold, angular_threshold) };
 }
 
 #[unsafe(no_mangle)]
@@ -560,4 +1157,34 @@ pub unsafe extern "C" fn sg_world_copy_events(
     let world = unsafe { &*world };
     let slice = unsafe { std::slice::from_raw_parts_mut(out, cap) };
     world.copy_events(slice)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_world_joint_event_count(world: *const SgWorld) -> usize {
+    if world.is_null() {
+        return 0;
+    }
+    unsafe { (*world).joint_event_count() }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_world_copy_joint_events(
+    world: *const SgWorld,
+    out: *mut SgJointEvent,
+    cap: usize,
+) -> usize {
+    if world.is_null() || out.is_null() {
+        return 0;
+    }
+    let world = unsafe { &*world };
+    let slice = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+    world.copy_joint_events(slice)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_world_joint_count(world: *const SgWorld) -> usize {
+    if world.is_null() {
+        return 0;
+    }
+    unsafe { (*world).joint_count() }
 }
