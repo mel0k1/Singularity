@@ -99,3 +99,80 @@ dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all 
 ```
 
 Hardware: same class as the Rust bench — 2-core Intel Xeon, Release, single process, single run.
+
+## The mirror: Rapier behind `SimulateWorld()`
+
+Phase 3: `IPhysicsBackend` is welded into the engine. `physics.backend = rapier` (new CVar, server-replicated, default `farseer`) routes `SharedPhysicsSystem.SimulateWorld()` through `RapierPhysicsBackend` (`csharp/engine/Robust.Shared/Physics/Backend/`) while the Farseer path stays untouched and default. One internal branch, zero component, serialization or content API changes.
+
+Protocol — the promised FFI contract in miniature: tables in, tables out, no reflection:
+
+- One Rust `SgWorld` per map (`singularity-physics-ffi`, cdylib), bodies and colliders keyed by entity id.
+- Per tick the backend scans the ECS once (`PhysicsComponent` + `FixturesComponent` + `TransformComponent`), diffs every body against a mirror state (pose, velocity, force, damping, kind, fixed-rotation, awake) and emits only the changes as `SgCommand` records into a pinned buffer; one `sg_world_apply` per map.
+- Fixtures diff by FNV fingerprint; an instance stamp (count + object identities) skips unchanged `FixturesComponent`s entirely, so a 512-tile grid costs nothing per tick. Axis-aligned rectangle polygons become cuboids — Rapier's fast path and exactly what the pure-Rust bench used.
+- `sg_world_step` integrates; `sg_world_copy_states` / `sg_world_copy_events` bulk-copy back. Positions apply as `SetLocalPositionRotation` deltas — the same primitive the Farseer solver uses for its own writeback — velocities go through a no-wake writer so sync never resets a sleep timer.
+- Collision events return per fixture pair with a 2-point manifold and are raised as native `StartCollideEvent` / `EndCollideEvent` on the C# event bus, both directions, same broadcast flags as the Farseer raiser; the bench `ContactCounterSystem` counts them the same way.
+- `PhysicsUpdateBeforeSolveEvent` / `AfterSolveEvent`, substepping, `FinalStep` and `autoclearforces` semantics are preserved inside the branch.
+
+Safety rails, each verified: ECS/components/content API untouched (one cvar + one internal branch); serialization and network states untouched; existing C# collision events preserved and counted; Dynamic/Static/Kinematic and the grid pattern exercised by the same sanity gates plus a `--strict` mode that fails CI on any regression; FFI and allocations measured separately (per-call micros and GC bytes per run); identical scenes, ticks and RNG on both backends with every semantic difference listed below.
+
+### Results
+
+Same 2-core host, .NET 10, Release, 600 ticks, single run per row; both backends through the identical harness:
+
+| scene | backend | p50 µs | p95 µs | max µs | asleep | contact starts | alloc MB | min_y | cargo dx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| idle | farseer | 6 | 7 | 21656 | 0 | 0 | 0.48 | — | — |
+| idle | rapier mirror | 23 | 31 | 26029 | 0 | 0 | 0.58 | — | — |
+| floor | farseer | 2225 | 3795 | 80411 | 38 | 824 | 138.5 | 0.355 | — |
+| floor | rapier mirror | 968 | 2418 | 72562 | 35 | 628 | 117.1 | 0.350 | — |
+| rain | farseer | 1737 | 2247 | 132722 | 0 | 3207 | 259.1 | 0.402 | — |
+| rain | rapier mirror | 2178 | 3221 | 74908 | 0 | 2446 | 242.8 | 0.397 | — |
+| mover | farseer | 101* | 139* | 16270* | 0 | 319 | 39.9 | **-280.4** | **0.000** |
+| mover | rapier mirror | 115 | 147 | 768 | 0 | 163 | 37.9 | 0.449 | **6.474** |
+
+\* mover/farseer is a broken scene, not a fair race: the cargo falls through from tick one (head-to-head finding 6), so the solver does a fraction of the intended work.
+
+FFI cost per tick, measured around each call separately:
+
+| scene | apply µs | step µs | states µs | events µs | total µs | cmds/tick | states/tick |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| idle | 0.6 | 1.0 | 0.2 | 0.1 | 1.9 | 1.1 | 3 |
+| floor | 1.2 | 135.1 | 5.2 | 0.4 | 141.9 | 2.7 | 141 |
+| rain | 4.9 | 321.4 | 9.6 | 0.7 | 336.6 | 3.9 | 228 |
+| mover | 0.2 | 47.4 | 1.1 | 0.1 | 48.8 | 0.4 | 33 |
+
+Findings:
+
+1. **Contact-heavy is where the hybrid pays: floor p50 2.30x** (2225 → 968 µs), p95 1.57x, allocations −15%. The floor tick is 99% solver on both backends, so this is Rapier-vs-Farseer through the same ECS.
+2. **Fall-heavy rain is 20% slower p50** (1737 → 2178 µs): the mirror's C# orchestration (full ECS rescan + per-body diff + writeback) costs ~1.84 ms/tick — about as much as Farseer's entire tick — and eats the ~1.4 ms the solver saves. The tail improves though: max 132.7 → 74.9 ms. Optimization path is clear: replace the per-tick full scan with an event-driven dirty set.
+3. **FFI transport is noise.** Apply + state + event copies, excluding the solve itself: 1.9–15 µs per tick, i.e. ~50–70 ns per body per tick. The command-buffer design holds; nothing here argues against Rust behind the seam.
+4. **The KinematicController gap is fixed outright**: the same scene that drops cargo through Farseer (min_y −280 m, cargo dx ~0) carries it 6.47 m on the mirror with a 768 µs max tick. `kinematic_velocity_based` is the semantics SS14 grids actually need.
+5. **Sleep parity with the engine defaults**: 35/138 asleep on the mirror vs 38/138 on Farseer under the same engine damping (0.2). The pure-Rust bench sleeps 125/138 — but only because it runs damping 0; bisecting damping in the mirror reproduces the pure numbers exactly (125/138, same 667 contact starts). Rapier 0.36 gates sleep on pose drift, and the engine's default damping keeps stacks drifting above threshold. Idle-cost parity holds out of the box; deeper sleep is a backend tuning knob (`linear_threshold`, `time_until_sleep`), not an engine change.
+6. **Determinism survives the full round trip**: double-run state hashes are bit-identical in all four scenes through scan → command buffer → Rust solve → writeback → event raise.
+7. **Two mirror bugs found and fixed by the gates are worth recording**: `SetAngularVelocity` in the engine wakes unconditionally (no wake flag), so the writeback needed a no-wake writer; and a NaN-seeded first-sync comparison silently skipped velocity pushes — kinematic platforms slept at zero velocity and never moved. Both are exactly the class of integration subtlety the strict mode exists to catch.
+
+### Semantic differences
+
+1. Joints are not mirrored yet (`SharedJointSystem` still owns them; the bench scenes are joint-free) — required before any content trial.
+2. `PreventCollideEvent`, the synchronous cancellable pair filter, has no Rapier path yet; it needs a reverse FFI call per pair, and its cost must be benchmarked before content relies on it.
+3. Solver lineage differs (Rapier TGS defaults vs the port's PGS 8/3): the same scenes settle to slightly different rest poses (floor min_y 0.350 vs 0.355). Bit-compatibility with Farseer is not a goal; determinism within a backend is, and holds.
+4. Damping formulas differ (`1/(1+dt·d)` vs `clamp(1−dt·d)`); at the engine default 0.2 the per-step difference is 1e-5.
+5. Sleep gates differ (pose drift vs velocity threshold); the `physics.timetosleep` / `physics.linsleeptol` cvars do not map yet.
+6. Client prediction falls back to the Farseer path in the spike (`prediction == true` bypasses the backend). The production plan — the same Rust artifact in the client and server binaries — is what makes prediction safe to switch over.
+7. In-place fixture edits (same `Fixture` and shape instances, new values) are not hot-detected by the instance stamp; add/remove/replace and shape swaps are. A version counter on `FixturesComponent` (one engine line) closes this.
+8. `PhysShapeAabb` maps to cuboid with the radius folded into half-extents; generic polygons ride the convex-hull path; edge/chain shapes are not mirrored yet.
+
+### Verdict
+
+The seam holds. Rapier behind `SimulateWorld()` keeps every content-facing contract intact — components, serialization, collision events — costs ~50–70 ns per body per tick in FFI transport, wins 2.3x p50 on the contact-heavy scene, fixes the kinematic cargo gap outright, and stays deterministic through the full round trip. Rapier is the physics backend for Singularity, pending: joints, the pair filter, incremental body collection, sleep tuning, and prediction parity via the shared binary.
+
+Reproduce:
+
+```sh
+cd rust
+cargo build --release -p singularity-physics-ffi
+cargo run --release -p singularity-physics --bin bench
+cd ../csharp
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=farseer --json
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=rapier --validate --strict --json
+```

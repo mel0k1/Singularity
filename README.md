@@ -53,19 +53,20 @@ The FFI contract: C# builds the registries — component types, network ids, ser
 | --- | --- | --- |
 | `rust/crates/singularity-crypto` | Rust | XChaCha20-Poly1305 frame codec, wire-compatible with `NetEncryption` |
 | `rust/crates/singularity-physics` | Rust | physics backend study: Rapier and Avian behind a shared `PhysicsBackend` seam, benchmarked and parity-checked — see [docs/physics-bench.md](docs/physics-bench.md) |
+| `rust/crates/singularity-physics-ffi` | Rust | the C ABI seam: per-map `SgWorld`, command-buffer apply, bulk state/event copy — the native side of `IPhysicsBackend` |
 | `rust/crates/singularity-net-transport` · planned | Rust | Lidgren-compatible transport study |
 | `rust/crates/singularity-pvs` · planned | Rust | SoA per-session visibility data |
-| `csharp/engine` | C# | vendored RobustToolbox @ fdb576c — the starting point of the orchestration core |
-| `csharp/benches/Singularity.PhysicsBench` | C# | the Farseer port measured in-situ on the real ECS — see [docs/physics-bench.md](docs/physics-bench.md) |
+| `csharp/engine` | C# | vendored RobustToolbox @ fdb576c — the starting point of the orchestration core; carries the `IPhysicsBackend` seam behind `SharedPhysicsSystem.SimulateWorld()` |
+| `csharp/benches/Singularity.PhysicsBench` | C# | farseer and the rapier mirror measured in-situ on the real ECS — see [docs/physics-bench.md](docs/physics-bench.md) |
 
 ## Status
 
-Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Two spikes are implemented, tested and benchmarked: `singularity-crypto` and `singularity-physics`. The C# core is on board as a vendored engine, and the Farseer port has been measured head-to-head: 10.9–25.8x behind Rapier on p50, deterministic under double-run hashing, with a measured KinematicController parity gap.
+Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Three spikes are implemented, tested and benchmarked: `singularity-crypto`, `singularity-physics` and the in-engine mirror — `IPhysicsBackend` with a Rapier backend behind `SimulateWorld()`, switchable by the `physics.backend` cvar, default off. Same scenes, same ECS: 2.3x p50 on the contact-heavy floor scene, the KinematicController cargo gap fixed outright, bit-identical double-run determinism, FFI transport at ~50–70 ns per body per tick — see [docs/physics-bench.md](docs/physics-bench.md).
 
 ## Roadmap
 
 1. `singularity-crypto` — done
-2. `singularity-physics` — study done: Rapier and Avian behind a neutral `PhysicsBackend` seam, deterministic under double-run hashing; Rapier leads p50 by 3.7–5.0x, Avian shows 25 ms spikes; swap deferred until profiling on real content. Head-to-head vs the Farseer port: done — see [docs/physics-bench.md](docs/physics-bench.md)
+2. `singularity-physics` — done and in: `IPhysicsBackend` behind `SimulateWorld()`, rapier mirror measured in-situ (docs/physics-bench.md) — verdict: Rapier is the backend, pending joints, pair filter, incremental collection, sleep tuning, prediction parity
 3. `singularity-net-transport` — study the Lidgren fork wire protocol before touching a single byte of it
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
 5. C# core onboarding — done: engine vendored (`csharp/engine`), Farseer measured in-situ (`csharp/benches`), determinism confirmed
@@ -76,11 +77,13 @@ Research phase complete. The Robust Toolbox sources were studied subsystem by su
 cd rust
 cargo build --release
 cargo test --all
+cargo run --release -p singularity-physics --bin bench
 ```
 
 ```sh
 cd csharp
 dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate --strict --backend=rapier
 ```
 
 ## Code style
