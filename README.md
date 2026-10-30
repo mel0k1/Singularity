@@ -61,12 +61,12 @@ The FFI contract: C# builds the registries — component types, network ids, ser
 
 ## Status
 
-Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Three spikes are implemented, tested and benchmarked: `singularity-crypto`, `singularity-physics` and the in-engine mirror — `IPhysicsBackend` with a Rapier backend behind `SimulateWorld()`, switchable by the `physics.backend` cvar, default off. Same scenes, same ECS: 2.3x p50 on the contact-heavy floor scene, the KinematicController cargo gap fixed outright, bit-identical double-run determinism, FFI transport at ~50–70 ns per body per tick — see [docs/physics-bench.md](docs/physics-bench.md).
+Research phase complete. The Robust Toolbox sources were studied subsystem by subsystem — ECS, IoC, serialization, prototypes, GameStates/PVS, network, physics, native interop. Three spikes are implemented, tested and benchmarked: `singularity-crypto`, `singularity-physics` and the in-engine mirror — `IPhysicsBackend` with a Rapier backend behind `SimulateWorld()`, switchable by the `physics.backend` cvar, default off. Round 2 closed the whole verdict list: distance/revolute/prismatic/weld joints with breaks and `CollideConnected`, `PreventCollideEvent` as a cached reverse FFI call through the engine's own `ShouldCollideSlow`, incremental body collection (bit-identical to the full scan in every scene, 17x less orchestration on fall-heavy scenes), and engine sleep cvars mapped onto Rapier thresholds. Same scenes, same ECS: 2.3x p50 on the contact-heavy floor scene, the KinematicController cargo gap fixed outright, 2.5x more bodies asleep than the Farseer path at rest, bit-identical double-run determinism — see [docs/physics-bench.md](docs/physics-bench.md).
 
 ## Roadmap
 
 1. `singularity-crypto` — done
-2. `singularity-physics` — done and in: `IPhysicsBackend` behind `SimulateWorld()`, rapier mirror measured in-situ (docs/physics-bench.md) — verdict: Rapier is the backend, pending joints, pair filter, incremental collection, sleep tuning, prediction parity
+2. `singularity-physics` — done and in: `IPhysicsBackend` behind `SimulateWorld()`, rapier mirror measured in-situ (docs/physics-bench.md) — joints, pair filter, incremental collection and sleep tuning landed; prediction parity via the shared binary remains
 3. `singularity-net-transport` — study the Lidgren fork wire protocol before touching a single byte of it
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
 5. C# core onboarding — done: engine vendored (`csharp/engine`), Farseer measured in-situ (`csharp/benches`), determinism confirmed
@@ -84,6 +84,7 @@ cargo run --release -p singularity-physics --bin bench
 cd csharp
 dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate
 dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate --strict --backend=rapier
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --verify-sync
 ```
 
 ## Code style

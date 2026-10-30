@@ -166,13 +166,83 @@ Findings:
 
 The seam holds. Rapier behind `SimulateWorld()` keeps every content-facing contract intact — components, serialization, collision events — costs ~50–70 ns per body per tick in FFI transport, wins 2.3x p50 on the contact-heavy scene, fixes the kinematic cargo gap outright, and stays deterministic through the full round trip. Rapier is the physics backend for Singularity, pending: joints, the pair filter, incremental body collection, sleep tuning, and prediction parity via the shared binary.
 
+## Round 2: joints, the pair filter, incremental collection, sleep tuning
+
+Everything the verdict listed as pending, done. ABI bumped to 2 (`OP_ADD_JOINT` + `OP_SET_JOINT_PARAMS` pair, `OP_REMOVE_JOINT`, `OP_SET_SLEEP`, reverse pair-filter callback, joint-event out-table). Three new scenes exercise the new surface on both backends — `chain` (12 boxes on revolute joints hanging from a static anchor plus a 6-bead rigid distance-joint rope, `CollideConnected = false`), `welds` (16 box pairs welded with a π/2 reference angle and seam anchors, dropped onto a platform), `prevent` (40 discs onto a platform with a system cancelling every `PreventCollideEvent` where the other body is dynamic — everything must fall through, zero contacts, on both backends).
+
+Same 2-core host, .NET 10, Release, 600 ticks, single run per row. `orch` is the new C# orchestration metric (dirty collection + diffing, excluding FFI calls):
+
+| scene | backend | p50 µs | p95 µs | max µs | asleep | contacts | joints | orch µs/t | min_y |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| chain | farseer | 88 | 124 | 3431 | 0 | 40 | 18 | — | 8.575 |
+| chain | rapier mirror | 73 | 91 | 10184 | 0 | 46 | 18 | 2.8 | 8.571 |
+| welds | farseer | 2 | 122 | 27006 | 32 | 60 | 16 | — | 0.463 |
+| welds | rapier mirror | 18 | 118 | 1157 | 32 | 60 | 16 | 1.0 | 0.450 |
+| prevent | farseer | 90 | 165 | 1360 | 0 | 0 | 0 | — | -275.1 |
+| prevent | rapier mirror | 124 | 149 | 21263 | 0 | 0 | 0 | 5.5 | -275.9 |
+
+Full-scene comparison after incremental collection landed (same host, same runs):
+
+| scene | backend | p50 µs | p95 µs | max µs | asleep | contacts | alloc MB | dirty/t | audit misses |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| idle | farseer | 5 | 8 | 22051 | 0 | 0 | 0.48 | — | — |
+| idle | rapier mirror | 6 | 12 | 34698 | 0 | 0 | 0.58 | 0.0 | 0 |
+| floor | farseer | 2890 | 4173 | 68967 | 38 | 824 | 156.6 | — | — |
+| floor | rapier mirror | 1283 | 2212 | 86078 | 97 | 955 | 122.0 | 106.3 | 0 |
+| rain | farseer | 1600 | 2077 | 97656 | 0 | 3207 | 259.1 | — | — |
+| rain | rapier mirror | 1866 | 3160 | 171056 | 0 | 2647 | 224.2 | 218.3 | 0 |
+| mover | farseer | 122* | 157* | 18260* | 0 | 319 | 39.9 | — | — |
+| mover | rapier mirror | 138 | 166 | 1009 | 0 | 238 | 37.9 | 32.0 | 0 |
+
+\* mover/farseer remains the broken KinematicController scene (head-to-head finding 6).
+
+### Joints
+
+Distance (rigid → rope limits, soft → spring), revolute (limits + force-based motor), prismatic (axis, limits, motor) and weld map onto Rapier impulse joints; the reference angle folds into `local_frame2.rotation = -referenceAngle` (validated by sign-sensitive tests on both ends). Joint identity is a per-pair numeric id; per-tick the mirror fingerprints every `JointComponent` (cheap: joint populations are tiny next to body counts) and re-issues only changed joints — `chain` costs 18 add-commands once and zero thereafter. `CollideConnected = false` maps to Rapier's `contacts_enabled(false)` and, redundantly, to a blocking rule in the pair filter, matching `ShouldCollideJoints`'s any-joint-blocks semantics. Friction and mouse joints are not mirrored (warn-once); soft welds ride Rapier's rigid `FixedJoint` — `welds` measures 0.000 rad drift on both backends, so the rigid approximation held everything the scene asked of it.
+
+Breakpoints: the Rust side reports joint breaks from the sum of locked-axis, limit and motor impulses (all three live in different fields in Rapier 0.36), and the C# side raises the same `JointBreakEvent` trio (directed A, directed B, broadcast) that the Farseer path raises, then disables the joint. The impulse proxy is Rapier-internal lambda accumulation — monotone in load but **not calibrated to Farseer's `GetReactionForce` Newtons**; default breakpoints (`float.MaxValue`) never break, content-set small breakpoints will fire at different loads than Farseer would. Calibration is a follow-up, not a blocker.
+
+### The pair filter
+
+`PreventCollideEvent` crosses the boundary as a reverse call: the world holds a CDECL function pointer + context handle, and Rapier's `filter_contact_pair`/`filter_intersection_pair` hooks (enabled on every mirrored collider) resolve collider ids → entities and run the engine's own `ShouldCollideSlow` — the exact same code path, builtin rules and event raiser as Farseer, including the static-child and kinematic-controller rules that live in C#. Decisions are cached per unordered collider pair, which reproduces Farseer's evaluate-at-contact-creation semantics; the cache invalidates when a joint between the two bodies changes and when either collider is re-created.
+
+Numbers: the whole `prevent` run makes 525 reverse calls (Farseer raises 3612 directed `PreventCollideEvent`s in the same scene — the cache suppresses re-asks for pairs that stay rejected), and contact-heavy scenes pay single-digit calls per tick (floor 558 over 600 ticks). The reverse call is not on any hot path that matters.
+
+The same pass fixed a real parity bug: the mirror pushed collision groups with `InteractionTestMode::And` while Farseer's `ShouldCollide` is OR over the two mask/layer directions. With `Or`, floor counts 955 contact starts against Farseer's 824 (was 628) — the remaining gap is solver lineage, not filtering.
+
+### Incremental body collection
+
+The per-tick full ECS rescan is gone. The dirty set now comes from the engine's own movement plumbing, consumed and cleared by the mirror: `AwakeBodies` (every body that can possibly have new velocities — and the only ones whose velocity writes matter, since writes to a sleeping body take effect at wake-up, which re-enters the awake set), `MoveBuffer` (fixture proxies — spawned bodies, moved bodies, re-parented bodies, fixture edits), `MovedGrids` (subtree walk of every moved grid so grid-children get their world poses refreshed), `EntityDeleted` and `CollisionChangeEvent`. A full-scan audit runs every 32 ticks as the safety net and counts `AuditMisses` — changes it had to make that no event signalled. Cross-map moves emit a removal into the old map's command stream and an add into the new one. `SINGULARITY_RAPIER_SYNC=full` forces the old full-scan path for A/B.
+
+Results: **full and incremental produce bit-identical state hashes in all seven scenes** (`--verify-sync`, now a CI gate). Orchestration drops from ~1.84 ms/tick to 106 µs/tick on `rain` — 17x — and the p50 gap to Farseer on `rain` closes from +25% to +17% (the remaining mirror overhead is the state copy-back plus the writeback path). `welds` settles to 3.7 dirty bodies per tick. Audit misses: 0 across every scene — the event sources cover everything these scenes do. The one hole by design: in-place fixture edits and `SetBodyType`/`SetFixedRotation`/`SetSleepingAllowed` on *sleeping* bodies are audit-caught within 0.53 s at worst (no engine hook needed — adding one line per setter closes it entirely if content ever trips the counter).
+
+A second-order win nobody planned: the old full scan re-pushed pose drift on resting stacks every tick, and those transform pushes carried a wake flag — the sync itself was keeping bodies awake. With incremental collection, resting bodies are never touched: floor now sleeps 97/138 bodies against Farseer's 38.
+
+### Sleep tuning
+
+`physics.timetosleep`, `physics.linsleeptol` and `physics.angsleeptol` now map onto per-body `time_until_sleep` / `normalized_linear_threshold` / `angular_threshold` at world creation (`--sleep=native` restores Rapier's own 0.5 s / 0.05 for A/B). `SleepingAllowed = false` disables sleep outright (thresholds −1) instead of the old keep-waking hack. The mapping is honest about semantics: Rapier 0.36 gates sleep on farthest-point pose drift (solver corrections included), not center-of-mass velocity, and `angsleeptol` only affects collider-less bodies — the cvars transfer their intent, not their formula. On floor: native 108 asleep, engine-mapped 97 (stricter threshold, faster timer), Farseer 38. Kinematic bodies sleep only at exactly zero velocity, which is what the mover platform wants.
+
+### Semantic differences, updated
+
+1. ~~Joints are not mirrored yet~~ — done: distance/revolute/prismatic/weld mirrored and gated; friction/mouse joints warn-and-skip; soft welds are rigid; the break impulse proxy is uncalibrated against Farseer Newtons.
+2. ~~`PreventCollideEvent` has no Rapier path~~ — done: reverse call through `ShouldCollideSlow`, per-pair cached, invalidated on joint changes; `RegenerateContacts`-forced refilters are not hooked (no event exists to hook).
+3. Solver lineage differs (Rapier TGS defaults vs the port's PGS 8/3); rest poses differ slightly (floor min_y 0.350 vs 0.355). Bit-compatibility is not a goal; per-backend determinism holds.
+4. Damping formulas differ; at engine default 0.2 the per-step difference is 1e-5.
+5. ~~`physics.timetosleep` / `physics.linsleeptol` do not map~~ — done, with the drift-vs-velocity caveat above.
+6. Client prediction still falls back to the Farseer path (`prediction == true` bypasses the backend). The shared-binary plan stands.
+7. In-place fixture edits and setter writes on sleeping bodies (`SetBodyType`, `SetFixedRotation`, `SetSleepingAllowed`) rely on the 32-tick audit; `AuditMisses` counts every catch (0 so far).
+8. `PhysShapeAabb` folds its radius into cuboid half-extents; generic polygons ride convex hulls; edge/chain shapes are not mirrored.
+9. `InteractionTestMode` is now `Or`, matching Farseer's `ShouldCollide` (was `And` — a parity bug fixed in this round).
+
 Reproduce:
 
 ```sh
 cd rust
+cargo test -p singularity-physics-ffi
 cargo build --release -p singularity-physics-ffi
-cargo run --release -p singularity-physics --bin bench
 cd ../csharp
-dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=farseer --json
-dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=rapier --validate --strict --json
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=farseer
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --backend=rapier
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --validate --strict --backend=rapier
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --ticks=600 --verify-sync
 ```

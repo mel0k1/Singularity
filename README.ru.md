@@ -61,12 +61,12 @@ FFI-контракт: C# собирает реестры — типы компо
 
 ## Статус
 
-Фаза исследования завершена. Исходники Robust Toolbox изучены подсистема за подсистемой — ECS, IoC, сериализация, прототипы, GameStates/PVS, сеть, физика, нативные границы. Три спайка реализованы, протестированы и замерены: `singularity-crypto`, `singularity-physics` и зеркало внутри движка — `IPhysicsBackend` с Rapier-бэкендом за `SimulateWorld()`, переключается cvar-ом `physics.backend`, по умолчанию выключен. Те же сцены, тот же ECS: 2,3× по p50 на контактно-тяжёлой сцене floor, провал KinematicController исправлен полностью, детерминизм двойного прогона бит-в-бит, транспорт FFI ~50–70 нс на тело за тик — см. [docs/physics-bench.md](docs/physics-bench.md).
+Фаза исследования завершена. Исходники Robust Toolbox изучены подсистема за подсистемой — ECS, IoC, сериализация, прототипы, GameStates/PVS, сеть, физика, нативные границы. Три спайка реализованы, протестированы и замерены: `singularity-crypto`, `singularity-physics` и зеркало внутри движка — `IPhysicsBackend` с Rapier-бэкендом за `SimulateWorld()`, переключается cvar-ом `physics.backend`, по умолчанию выключен. Второй раунд закрыл весь список вердикта: джоинты distance/revolute/prismatic/weld с разрывами и `CollideConnected`, `PreventCollideEvent` как кэшированный обратный FFI-вызов через родной `ShouldCollideSlow`, инкрементальный сбор тел (бит-в-бит идентичен полному скану во всех сценах, в 17 раз меньше оркестрации на падающих сценах) и движковые cvar-ы сна, отображённые на пороги Rapier. Те же сцены, тот же ECS: 2,3× по p50 на контактно-тяжёлой сцене floor, провал KinematicController исправлен полностью, в покое спит в 2,5 раза больше тел, чем на Farseer, детерминизм двойного прогона бит-в-бит — см. [docs/physics-bench.md](docs/physics-bench.md).
 
 ## Дорожная карта
 
 1. `singularity-crypto` — сделано
-2. `singularity-physics` — сделано и внедрено: `IPhysicsBackend` за `SimulateWorld()`, rapier-зеркало замерено в лоб ([docs/physics-bench.md](docs/physics-bench.md)) — вердикт: Rapier — бэкенд Singularity; осталось: джоинты, парный фильтр, инкрементальный сбор тел, тюнинг сна, паритет предсказаний
+2. `singularity-physics` — сделано и внедрено: `IPhysicsBackend` за `SimulateWorld()`, rapier-зеркало замерено в лоб ([docs/physics-bench.md](docs/physics-bench.md)) — джоинты, парный фильтр, инкрементальный сбор и тюнинг сна сделаны; остался паритет предсказаний через общий бинарь
 3. `singularity-net-transport` — сначала изучить проводной протокол форка Lidgren, не трогая ни байта
 4. `singularity-pvs` — SoA-данные сессий; pinned `PvsData` уже неуправляемые
 5. Подключение C#-ядра — сделано: движок завендорен, Farseer замерен в лоб, детерминизм подтверждён
@@ -84,6 +84,7 @@ cargo run --release -p singularity-physics --bin bench
 cd csharp
 dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate
 dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --validate --strict --backend=rapier
+dotnet run --project benches/Singularity.PhysicsBench -c Release -- --scene=all --verify-sync
 ```
 
 ## Стиль кода
