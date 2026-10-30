@@ -1,9 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/singularity-crypto"]
+members = [
+    "crates/singularity-crypto",
+    "crates/singularity-physics",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/mel0k1/Singularity"
+
+[workspace.dependencies]
+singularity-crypto = { path = "crates/singularity-crypto" }
+singularity-physics = { path = "crates/singularity-physics" }

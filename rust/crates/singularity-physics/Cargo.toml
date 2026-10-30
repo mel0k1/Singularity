@@ -1,0 +1,17 @@
+[package]
+name = "singularity-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rapier2d = "0.36.1"
+avian2d = { version = "0.8.0", default-features = false, features = [
+    "2d",
+    "parry-f32",
+    "default-collider",
+    "parallel",
+    "xpbd_joints",
+] }
+bevy = { version = "0.20.1", default-features = false, features = ["std", "bevy_log"] }
