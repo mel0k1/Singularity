@@ -47,7 +47,11 @@ impl Session {
             return None;
         }
         let head: [u8; COUNTER_BYTES] = frame[..COUNTER_BYTES].try_into().ok()?;
-        decrypt_frame(&self.cipher, u64::from_le_bytes(head), &frame[COUNTER_BYTES..])
+        decrypt_frame(
+            &self.cipher,
+            u64::from_le_bytes(head),
+            &frame[COUNTER_BYTES..],
+        )
     }
 }
 
@@ -60,7 +64,7 @@ fn nonce_from(counter: u64) -> [u8; 24] {
 fn encrypt_frame(cipher: &XChaCha20Poly1305, counter: u64, plaintext: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(plaintext.len() + TAG_BYTES);
     body.extend_from_slice(plaintext);
-    cipher.encrypt_in_place(&GenericArray::from(nonce_from(counter)), b"", &mut body);
+    let _ = cipher.encrypt_in_place(&GenericArray::from(nonce_from(counter)), b"", &mut body);
     let mut frame = Vec::with_capacity(body.len() + COUNTER_BYTES);
     frame.extend_from_slice(&counter.to_le_bytes());
     frame.extend_from_slice(&body);
@@ -69,7 +73,11 @@ fn encrypt_frame(cipher: &XChaCha20Poly1305, counter: u64, plaintext: &[u8]) -> 
 
 fn decrypt_frame(cipher: &XChaCha20Poly1305, counter: u64, body: &[u8]) -> Option<Vec<u8>> {
     let mut plaintext = body.to_vec();
-    match cipher.decrypt_in_place(&GenericArray::from(nonce_from(counter)), b"", &mut plaintext) {
+    match cipher.decrypt_in_place(
+        &GenericArray::from(nonce_from(counter)),
+        b"",
+        &mut plaintext,
+    ) {
         Ok(()) => Some(plaintext),
         Err(_) => None,
     }

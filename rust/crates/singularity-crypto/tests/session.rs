@@ -1,4 +1,4 @@
-use singularity_crypto::{Key, Session, Side, FRAME_OVERHEAD};
+use singularity_crypto::{FRAME_OVERHEAD, Key, Session, Side};
 
 fn key(fill: u8) -> Key {
     [fill; 32]
