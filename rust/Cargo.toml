@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/singularity-crypto",
     "crates/singularity-physics",
+    "crates/singularity-physics-ffi",
 ]
 
 [workspace.package]
