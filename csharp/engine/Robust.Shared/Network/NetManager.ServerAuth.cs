@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Threading.Tasks;
 using Lidgren.Network;
 using Robust.Shared.AuthLib;
+using Robust.Shared.Network.Transport;
 using Robust.Shared.Log;
 using Robust.Shared.Network.Messages.Handshake;
 using Robust.Shared.Utility;
@@ -34,7 +35,7 @@ namespace Robust.Shared.Network
             _authLogger.Debug("Public key is {0}", Convert.ToBase64String(CryptoPublicKey));
         }
 
-        private async void HandleHandshake(NetPeerData peer, NetConnection connection)
+        private async void HandleHandshake(NetPeerData peer, INetTransportConnection connection)
         {
             try
             {
@@ -88,11 +89,11 @@ namespace Robust.Shared.Network
                         WantHwid = wantHwid
                     };
 
-                    var outMsgEncReq = peer.Peer.CreateMessage();
+                    var outMsgEncReq = connection.CreateMessage();
                     outMsgEncReq.Write(false);
                     outMsgEncReq.WritePadBits();
                     msgEncReq.WriteToBuffer(outMsgEncReq, _serializer);
-                    peer.Peer.SendMessage(outMsgEncReq, connection, NetDeliveryMethod.ReliableOrdered);
+                    connection.Send(outMsgEncReq, NetDeliveryMethod.ReliableOrdered, 0);
 
                     _logger.Verbose(
                         $"{connection.RemoteEndPoint}: Awaiting MsgEncryptionResponse");
@@ -299,7 +300,7 @@ namespace Robust.Shared.Network
 
                 _logger.Verbose($"{connection.RemoteEndPoint}: Sending MsgLoginSuccess");
 
-                var msg = peer.Peer.CreateMessage();
+                var msg = connection.CreateMessage();
                 var msgResp = new MsgLoginSuccess
                 {
                     UserData = userData,
@@ -313,7 +314,7 @@ namespace Robust.Shared.Network
 
                 msgResp.WriteToBuffer(msg, _serializer);
                 encryption?.Encrypt(msg);
-                peer.Peer.SendMessage(msg, connection, NetDeliveryMethod.ReliableOrdered);
+                connection.Send(msg, NetDeliveryMethod.ReliableOrdered, 0);
 
                 _logger.Info("Approved {ConnectionEndpoint} with username {Username} user ID {userId} into the server",
                     connection.RemoteEndPoint, userData.UserName, userData.UserId);
@@ -352,7 +353,7 @@ namespace Robust.Shared.Network
             return (uid, LoginType.Guest);
         }
 
-        private Task AwaitDisconnectAsync(NetConnection connection)
+        private Task AwaitDisconnectAsync(INetTransportConnection connection)
         {
             if (!_awaitingDisconnect.TryGetValue(connection, out var tcs))
             {

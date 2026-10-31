@@ -116,12 +116,12 @@ public sealed partial class NetManager
     {
         channel.Encryption?.Encrypt(item.Message);
 
-        var result = channel.Connection.Peer.SendMessage(item.Message, channel.Connection, item.Method, item.SequenceChannel);
-        if (result is not (NetSendResult.Sent or NetSendResult.Queued))
+        var result = channel.Connection.Send(item.Message, item.Method, item.SequenceChannel);
+        if (!result)
         {
             // Logging stack trace here won't be useful as it'll likely be thread pooled on production scenarios.
             item.Owner._logger.Warning(
-                $"Failed to send message {item.RobustMessage} to {channel} via Lidgren: {result}");
+                $"Failed to send message {item.RobustMessage} to {channel}: the transport rejected it");
         }
     }
 

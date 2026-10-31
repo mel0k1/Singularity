@@ -16,6 +16,23 @@ Roadmap item 3. The seam: everything above `INetChannel` stays C# — `NetManage
 
 `net.backend` (`"lidgren"` default, `"singularity"` opt-in) selects the channel layer in `csharp/engine/Robust.Shared/Network/Transport/`: `SgTransportNative` (ABI 2 bindings), `SgTransport` (socket owner, event pump, overflow fetch, reason/RTT queries) and `SgTransportChannel : INetChannel` — now with real `Ping` (from pong-measured RTT), real `RemoteTimeOffset`, transport `CurrentMtu`, the full delivery mapping (`kind = NetDeliveryMethod + SequenceChannel`, so reliable-unordered and reliable-sequenced keep their semantics instead of collapsing into ordered), and `Disconnect(reason)` that actually crosses the wire.
 
+### The NetManager funnels (round 4)
+
+The seam now sits inside `NetManager` itself — `net.backend` (`"lidgren"` default, `"singularity"` opt-in) selects the transport for the real client and server, not just the standalone test classes:
+
+- `Transport/NetTransport.cs` — the internal seam: `INetTransportPeer`/`INetTransportConnection` plus `LidgrenTransportPeer`/`LidgrenTransportConnection` adapters over the unmodified Lidgren types. The adapter is cached in `NetConnection.Tag`, so the Lidgren hot path gains one type check per message and one interface dispatch per send — nanoseconds against the serializer's microseconds; the ReadMessage/Recycle pump loop is untouched.
+- `Transport/SgNetTransportPeer.cs` — the funnel peer over the `sg_transport_*` FFI: binds, connects, pumps events, maps `SgNetStats` into the engine's `NetworkStats`, and applies cvar settings (`net.mtu`, `net.lidgren_app_identifier`, `net.connection_timeout`, ping interval) through the same `NetTransportSettings` both backends share.
+- `NetManager` was re-keyed from raw `NetConnection` to `INetTransportConnection` everywhere (`_channels`, `_awaitingData`/`_awaitingStatusChange`, `_assignedUserIds`, `NetPeerData`) — the dictionaries, the dispatch core, the status-changed core and the login handshake are backend-agnostic; `ProcessPackets` branches per peer type (Lidgren keeps its exact `ReadMessage` loop, the singularity peer pumps FFI events).
+- Engine-level message encryption (`NetEncryption` on the channel) sits above the seam and works unchanged over both transports, exactly like it does over Lidgren.
+- `NetManagerRealPairTest` runs a real headless client and server over loopback UDP through the full engine funnel — `ClientConnect` (happy eyeballs), guest login (`MsgLoginStart`/`MsgLoginSuccess`), the message string table, serializer and transfer handshakes, then PVS game states carrying a spawned entity to the client with correct coordinates, then a disconnect propagating both ways. It runs for **both** `lidgren` and `singularity` — the native path is the regression control for the refactor.
+
+Two bugs surfaced only once the real funnel ran, both fixed:
+
+- The vendored test harness registered `MsgMapStrServerHandshake` without `NetMessageAccept.Handshake`, so the real `NetManager`'s pre-handshake message gate (which `IntegrationNetManager` never had) killed the connection on the serializer handshake. Latent harness bug, invisible until a test used the real funnel.
+- The Rust transport cleared its disconnect-reason table at the start of every `poll()`, so a reason recorded by an out-of-band disconnect (the engine dropping a channel mid-handler) was wiped before C# could read it. Disconnect reasons now ride inside the `Disconnected` event itself.
+
+Honest caps: Lidgren's `ConnectionApproval` path (`HandleApproval`, auto-approve) stays Lidgren-only — the singularity transport accepts connections in Rust and `IServerNetManager.HandleApprovalCallback` is not consulted (nothing in the engine sets it); UPnP port forwarding warns and skips on the singularity backend; IPv6 dual-stack sockets are not wired (`net.dual_stack` binds per-family, v6 sockets are v6-only like Lidgren's non-dual-stack default); `NetChannel.Connection` (raw `NetConnection`) is gone from the public surface — nothing in the engine used it.
+
 ### The wire-compat test
 
 `Robust.Shared.IntegrationTests/Networking/SgTransportWireCompatTest.cs` puts a Rust transport endpoint against a real, unmodified C# `NetServer` from the vendored fork over loopback UDP:
@@ -60,7 +77,7 @@ Loopback on the 2-core host, one process, release build. `cargo run --release -p
 
 ## Next steps
 
-1. Engine wiring: `NetManager` client/server funnels over `SgTransport` under `net.backend=singularity` — the approval callback, string tables and GameStates over the seam, then a real client↔server integration pair in CI on both backends.
+1. Soak the singularity funnel against real content: the pair test covers the engine funnel, content-level connect flow (server entry, admin auth) is the next proving ground, with `net.backend` still defaulting to `lidgren` until it holds up.
 2. MTU expansion initiation behind `net.mtu_expand` (binary search between largest-success/failure like the fork).
 3. Pacing: the fork coalesces ack/sends across ~3 heartbeat frames (10 ms) while this transport flushes per poll — fine on loopback, worth measuring under real GameStates before calling it done.
 4. Window tuning is untouched on purpose: the constants are Lidgren's, so behavior matches first and diverges measurably later.

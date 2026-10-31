@@ -76,6 +76,22 @@ impl Pair {
 }
 
 #[test]
+fn ipv6_wildcard_binds_v6_only() {
+    let v6 = UdpTransport::bind("[::1]:0").unwrap();
+    assert!(v6.local_addr().unwrap().is_ipv6());
+
+    let wildcard = UdpTransport::bind("[::]:0").unwrap();
+    assert!(wildcard.local_addr().unwrap().is_ipv6());
+
+    let v4 = UdpTransport::bind("0.0.0.0:0").unwrap();
+    assert!(v4.local_addr().unwrap().is_ipv4());
+
+    let mut pair = Pair::new();
+    pair.connect();
+    assert!(pair.established());
+}
+
+#[test]
 fn handshake_completes_on_both_sides() {
     let mut pair = Pair::new();
     pair.connect();
@@ -204,7 +220,7 @@ fn close_notifies_peer_and_carries_reason() {
     while disconnected.is_none() && Instant::now() < deadline {
         pair.step();
         for (event, _) in pair.server_events.drain(..) {
-            if let TransportEvent::Disconnected(id) = event {
+            if let TransportEvent::Disconnected(id, _) = event {
                 disconnected = Some(id);
             }
         }
@@ -240,7 +256,7 @@ fn silence_times_out() {
     while timed_out.is_none() && Instant::now() < deadline {
         pair.server.poll(&mut pair.server_events);
         for (event, _) in pair.server_events.drain(..) {
-            if let TransportEvent::Disconnected(id) = event {
+            if let TransportEvent::Disconnected(id, _) = event {
                 timed_out = Some(id);
             }
         }
@@ -547,4 +563,54 @@ fn ffi_surface_end_to_end() {
         sg_transport_destroy(client);
         sg_transport_destroy(server);
     }
+}
+
+#[test]
+fn reliable_burst_far_past_window_stays_alive() {
+    let mut pair = Pair::new();
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+
+    let count = 300u32;
+    let payload = vec![0x77u8; 500];
+    for i in 0..count {
+        let mut message = payload.clone();
+        message[0..4].copy_from_slice(&i.to_le_bytes());
+        assert!(
+            pair.client.send(conn, Delivery::ReliableOrdered, &message),
+            "send {} rejected",
+            i
+        );
+    }
+
+    let mut seen: Vec<u32> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while seen.len() < count as usize && Instant::now() < deadline {
+        pair.step();
+        for (event, data) in pair.server_events.drain(..) {
+            match event {
+                TransportEvent::Received(_) if data.len() == 500 => {
+                    seen.push(u32::from_le_bytes(data[0..4].try_into().unwrap()));
+                }
+                TransportEvent::Disconnected(..) => {
+                    panic!("connection died mid-burst after {} messages", seen.len());
+                }
+                _ => {}
+            }
+        }
+        for (event, _) in pair.client_events.drain(..) {
+            if let TransportEvent::Disconnected(..) = event {
+                panic!(
+                    "client connection died mid-burst after {} messages",
+                    seen.len()
+                );
+            }
+        }
+    }
+
+    assert_eq!(seen.len(), count as usize, "burst lost messages");
+    let ordered: Vec<u32> = (0..count).collect();
+    assert_eq!(seen, ordered, "burst order broken");
+    assert!(pair.server.stats().connections == 1);
 }

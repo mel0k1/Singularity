@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Threading;
 using Lidgren.Network;
 using Robust.Shared.Log;
+using Robust.Shared.Network.Transport;
 using Robust.Shared.Utility;
 
 namespace Robust.Shared.Network;
@@ -15,7 +16,12 @@ public partial class NetManager
         var sawmill = _logMan.GetSawmill("net.upnp");
         var port = Port;
 
-        var peers = _netPeers.Select(p => p.Peer).Where(p => p.Configuration.EnableUPnP).ToArray();
+        var peers = _netPeers
+            .Select(p => p.Transport)
+            .OfType<LidgrenTransportPeer>()
+            .Select(p => p.Peer)
+            .Where(p => p.Configuration.EnableUPnP)
+            .ToArray();
         if (peers.Length == 0)
         {
             sawmill.Warning("Can't UPnP forward: No IPv4-compatible NetPeers available.");

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use protocol::MIN_MTU;
 use wire::{HEADER_BYTES, KIND_CONNECT, MAX_MTU};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 pub const MAX_EVENT_INLINE: usize = 1200;
 pub const MAX_UNRELIABLE_BYTES: usize = 8191;
@@ -42,10 +42,10 @@ impl Delivery {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnectionId(pub u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TransportEvent {
     Connected(ConnectionId),
-    Disconnected(ConnectionId),
+    Disconnected(ConnectionId, String),
     Received(ConnectionId),
 }
 
@@ -115,7 +115,7 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpTransport> {
-        let socket = UdpSocket::bind(addr)?;
+        let socket = bind_socket(addr)?;
         socket.set_nonblocking(true)?;
         Ok(UdpTransport {
             wire: Wire {
@@ -142,6 +142,11 @@ impl UdpTransport {
 
     pub fn remote_endpoint(&self, conn: ConnectionId) -> Option<SocketAddr> {
         self.by_id.get(&conn).copied()
+    }
+
+    pub fn remote_identifier(&self, conn: ConnectionId) -> Option<i64> {
+        let addr = self.by_id.get(&conn)?;
+        Some(self.connections.get(addr)?.protocol.remote_unique_id as i64)
     }
 
     pub fn set_timings(
@@ -243,9 +248,14 @@ impl UdpTransport {
         }
         if let Some(connection) = self.connections.remove(&addr) {
             self.by_id.remove(&connection.id);
+            if self.reasons.len() > 1024 {
+                self.reasons.clear();
+            }
             self.reasons.insert(connection.id, reason.to_owned());
-            self.events
-                .push((TransportEvent::Disconnected(connection.id), Vec::new()));
+            self.events.push((
+                TransportEvent::Disconnected(connection.id, reason.to_owned()),
+                Vec::new(),
+            ));
         }
     }
 
@@ -275,7 +285,6 @@ impl UdpTransport {
 
     pub fn poll(&mut self, out: &mut Vec<(TransportEvent, Vec<u8>)>) {
         out.clear();
-        self.reasons.clear();
         loop {
             let mut drained = 0;
             for _ in 0..POLL_BURST {
@@ -409,9 +418,12 @@ impl UdpTransport {
         if let Some((id, reason)) = finished {
             self.connections.remove(&addr);
             self.by_id.remove(&id);
-            self.reasons.insert(id, reason);
+            if self.reasons.len() > 1024 {
+                self.reasons.clear();
+            }
+            self.reasons.insert(id, reason.clone());
             self.events
-                .push((TransportEvent::Disconnected(id), Vec::new()));
+                .push((TransportEvent::Disconnected(id, reason), Vec::new()));
         }
     }
 }
@@ -423,4 +435,21 @@ fn unique_identifier() -> u64 {
         .unwrap_or(0x5eed_0000_0000_0001);
     let pid = u64::from(std::process::id());
     (nanos ^ (pid << 32) ^ 0x9e37_79b9_7f4a_7c15) | 1
+}
+
+fn bind_socket<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
+    let mut addresses = addr.to_socket_addrs()?;
+    let address = addresses
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses to bind"))?;
+    let domain = match address {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&address.into())?;
+    Ok(UdpSocket::from(socket))
 }

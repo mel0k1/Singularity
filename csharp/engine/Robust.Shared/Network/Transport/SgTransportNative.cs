@@ -8,7 +8,7 @@ namespace Robust.Shared.Network.Transport;
 
 internal static class SgTransportNative
 {
-    public const uint AbiVersion = 2;
+    public const uint AbiVersion = 3;
 
     public const uint EventConnected = 0;
     public const uint EventDisconnected = 1;
@@ -148,6 +148,9 @@ internal static class SgTransportNative
         ulong connection,
         byte* buffer,
         nuint capacity);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern long sg_transport_remote_identifier(IntPtr transport, ulong connection);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern uint sg_transport_remote_endpoint(

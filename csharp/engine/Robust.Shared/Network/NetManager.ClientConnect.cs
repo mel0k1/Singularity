@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Lidgren.Network;
 using Robust.Shared.Network.Messages.Handshake;
+using Robust.Shared.Network.Transport;
 using Robust.Shared.Utility;
 using SpaceWizards.Sodium;
 
@@ -34,12 +35,12 @@ namespace Robust.Shared.Network
         public event Action<ClientConnectionState>? ClientConnectStateChanged;
 
         private readonly
-            Dictionary<NetConnection, (CancellationTokenRegistration reg, TaskCompletionSource<string> tcs)>
+            Dictionary<INetTransportConnection, (CancellationTokenRegistration reg, TaskCompletionSource<string> tcs)>
             _awaitingStatusChange
                 = new();
 
         private readonly
-            Dictionary<NetConnection, (CancellationTokenRegistration, TaskCompletionSource<NetIncomingMessage>)>
+            Dictionary<INetTransportConnection, (CancellationTokenRegistration, TaskCompletionSource<NetIncomingMessage>)>
             _awaitingData =
                 new();
 
@@ -98,8 +99,8 @@ namespace Robust.Shared.Network
             }
             catch (OperationCanceledException)
             {
-                winningPeer.Peer.Shutdown("Cancelled");
-                _toCleanNetPeers.Enqueue(winningPeer.Peer);
+                winningPeer.Transport.Shutdown("Cancelled");
+                _toCleanNetPeers.Enqueue(winningPeer.Transport);
                 ClientConnectState = ClientConnectionState.NotConnecting;
                 return;
             }
@@ -107,8 +108,8 @@ namespace Robust.Shared.Network
             {
                 OnConnectFailed(e.Message);
                 _logger.Error("Exception during handshake: {0}", e);
-                winningPeer.Peer.Shutdown("Something happened.");
-                _toCleanNetPeers.Enqueue(winningPeer.Peer);
+                winningPeer.Transport.Shutdown("Something happened.");
+                _toCleanNetPeers.Enqueue(winningPeer.Transport);
                 ClientConnectState = ClientConnectionState.NotConnecting;
                 return;
             }
@@ -120,7 +121,7 @@ namespace Robust.Shared.Network
 
         private async Task CCDoHandshake(
             NetPeerData peer,
-            NetConnection connection,
+            INetTransportConnection connection,
             string userNameRequest,
             CancellationToken cancel)
         {
@@ -143,9 +144,9 @@ namespace Robust.Shared.Network
                 Encrypt = encrypt
             };
 
-            var outLoginMsg = peer.Peer.CreateMessage();
+            var outLoginMsg = connection.CreateMessage();
             msgLogin.WriteToBuffer(outLoginMsg, _serializer);
-            peer.Peer.SendMessage(outLoginMsg, connection, NetDeliveryMethod.ReliableOrdered);
+            connection.Send(outLoginMsg, NetDeliveryMethod.ReliableOrdered, 0);
 
             NetEncryption? encryption = null;
             var response = await AwaitData(connection, cancel);
@@ -214,9 +215,9 @@ namespace Robust.Shared.Network
                     LegacyHwid = legacyHwid
                 };
 
-                var outEncRespMsg = peer.Peer.CreateMessage();
+                var outEncRespMsg = connection.CreateMessage();
                 encryptionResponse.WriteToBuffer(outEncRespMsg, _serializer);
-                peer.Peer.SendMessage(outEncRespMsg, connection, NetDeliveryMethod.ReliableOrdered);
+                connection.Send(outEncRespMsg, NetDeliveryMethod.ReliableOrdered, 0);
 
                 // Expect login success here.
                 response = await AwaitData(connection, cancel);
@@ -294,24 +295,47 @@ namespace Robust.Shared.Network
             return (first, second);
         }
 
-        private async Task<(NetPeerData winningPeer, NetConnection winningConnection)?>
+        private async Task<(NetPeerData winningPeer, INetTransportConnection winningConnection)?>
             CCHappyEyeballs(int port, IPAddress first, IPAddress? second, CancellationToken mainCancelToken)
         {
             // Try to establish a connection with an IP address and wait for it to either connect or fail
             // Returns a disposable wrapper around the peer/connection because ParallelTask
             async Task<ConnectionAttempt> AttemptConnection(IPAddress address, CancellationToken cancel)
             {
-                var config = _getBaseNetPeerConfig();
-                config.LocalAddress = address.AddressFamily == AddressFamily.InterNetworkV6
-                    ? IPAddress.IPv6Any
-                    : IPAddress.Any;
+                NetPeerData peerData;
+                INetTransportConnection connection;
 
-                var peer = new NetPeer(config);
-                peer.Start();
-                var peerData = new NetPeerData(peer);
-                _netPeers.Add(peerData);
+                if (UseSingularityTransport)
+                {
+                    var localAddress = address.AddressFamily == AddressFamily.InterNetworkV6
+                        ? IPAddress.IPv6Any
+                        : IPAddress.Any;
 
-                var connection = peer.Connect(new IPEndPoint(address, port));
+                    var transport = SgNetTransportPeer.Bind(new IPEndPoint(localAddress, 0), BuildTransportSettings());
+                    if (transport == null)
+                        throw new ConnectionFailedException("singularity transport failed to bind a socket");
+
+                    transport.Start();
+                    peerData = new NetPeerData(transport);
+                    _netPeers.Add(peerData);
+
+                    connection = transport.Connect(new IPEndPoint(address, port))
+                        ?? throw new ConnectionFailedException("singularity transport rejected the connect");
+                }
+                else
+                {
+                    var config = _getBaseNetPeerConfig();
+                    config.LocalAddress = address.AddressFamily == AddressFamily.InterNetworkV6
+                        ? IPAddress.IPv6Any
+                        : IPAddress.Any;
+
+                    var peer = new LidgrenTransportPeer(new NetPeer(config));
+                    peer.Start();
+                    peerData = new NetPeerData(peer);
+                    _netPeers.Add(peerData);
+
+                    connection = peer.Connect(new IPEndPoint(address, port))!;
+                }
 
                 try
                 {
@@ -321,8 +345,8 @@ namespace Robust.Shared.Network
                     if (connection.Status != NetConnectionStatus.Connected)
                     {
                         // Connection failed, clean up and yeet an exception
-                        peer.Shutdown(reason);
-                        _toCleanNetPeers.Enqueue(peer);
+                        peerData.Transport.Shutdown(reason);
+                        _toCleanNetPeers.Enqueue(peerData.Transport);
                         throw new ConnectionFailedException(reason);
                     }
 
@@ -331,14 +355,14 @@ namespace Robust.Shared.Network
                 catch (Exception)
                 {
                     // Something went wrong!
-                    peer.Shutdown("Connection attempt failed");
-                    _toCleanNetPeers.Enqueue(peer);
+                    peerData.Transport.Shutdown("Connection attempt failed");
+                    _toCleanNetPeers.Enqueue(peerData.Transport);
                     throw;
                 }
             }
 
             // Waits for a connection's status to change from InitiatedConnect to anything else
-            async Task<string> AwaitNonInitStatusChange(NetConnection connection, CancellationToken cancellationToken)
+            async Task<string> AwaitNonInitStatusChange(INetTransportConnection connection, CancellationToken cancellationToken)
             {
                 string reason;
                 NetConnectionStatus status;
@@ -403,7 +427,7 @@ namespace Robust.Shared.Network
                 reason.Contains("no response from remote host", StringComparison.OrdinalIgnoreCase);
         }
 
-        private Task<string> AwaitStatusChange(NetConnection connection, CancellationToken cancellationToken = default)
+        private Task<string> AwaitStatusChange(INetTransportConnection connection, CancellationToken cancellationToken = default)
         {
             if (_awaitingStatusChange.ContainsKey(connection))
             {
@@ -426,7 +450,7 @@ namespace Robust.Shared.Network
         }
 
         private Task<NetIncomingMessage> AwaitData(
-            NetConnection connection,
+            INetTransportConnection connection,
             CancellationToken cancellationToken = default)
         {
             if (_awaitingData.ContainsKey(connection))
@@ -485,15 +509,15 @@ namespace Robust.Shared.Network
 
         private sealed record JoinRequest(string Hash, string? Hwid);
 
-        private sealed class ConnectionAttempt(NetPeerData peer, NetConnection connection, NetManager netManager) : IDisposable
+        private sealed class ConnectionAttempt(NetPeerData peer, INetTransportConnection connection, NetManager netManager) : IDisposable
         {
             public NetPeerData Peer { get; } = peer;
-            public NetConnection Connection { get; } = connection;
+            public INetTransportConnection Connection { get; } = connection;
 
             public void Dispose()
             {
-                Peer.Peer.Shutdown("Disposing unused connection attempt");
-                netManager._toCleanNetPeers.Enqueue(Peer.Peer);
+                Peer.Transport.Shutdown("Disposing unused connection attempt");
+                netManager._toCleanNetPeers.Enqueue(Peer.Transport);
             }
         }
     }

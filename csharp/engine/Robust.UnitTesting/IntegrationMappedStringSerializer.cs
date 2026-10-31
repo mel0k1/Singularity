@@ -68,7 +68,8 @@ namespace Robust.UnitTesting
 
         public void Initialize()
         {
-            _net.RegisterNetMessage<MsgMapStrServerHandshake>(HandleServerHandshake, NetMessageAccept.Client);
+            _net.RegisterNetMessage<MsgMapStrServerHandshake>(HandleServerHandshake,
+                NetMessageAccept.Client | NetMessageAccept.Handshake);
         }
 
         private void HandleServerHandshake(MsgMapStrServerHandshake message)

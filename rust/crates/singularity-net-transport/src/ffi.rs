@@ -99,6 +99,21 @@ pub unsafe extern "C" fn sg_transport_connect(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_transport_remote_identifier(
+    transport: *const UdpTransport,
+    connection: u64,
+) -> i64 {
+    if transport.is_null() {
+        return 0;
+    }
+    unsafe {
+        (*transport)
+            .remote_identifier(ConnectionId(connection))
+            .unwrap_or(0)
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sg_transport_remote_endpoint(
     transport: *const UdpTransport,
     connection: u64,
@@ -159,22 +174,34 @@ pub unsafe extern "C" fn sg_transport_poll(
         if written >= cap {
             break;
         }
-        let (kind, connection) = match event {
-            TransportEvent::Connected(id) => (EVENT_CONNECTED, id.0),
-            TransportEvent::Disconnected(id) => (EVENT_DISCONNECTED, id.0),
-            TransportEvent::Received(id) => (EVENT_RECEIVED, id.0),
-        };
         let slot = unsafe { &mut *out.add(written) };
-        slot.kind = kind;
-        slot.connection = connection;
-        slot.length = payload.len() as u32;
-        if payload.len() <= MAX_EVENT_INLINE {
-            slot.reserved = EVENT_INLINE;
-            slot.data[..payload.len()].copy_from_slice(&payload);
-        } else {
-            slot.reserved = EVENT_OVERFLOW;
-            slot.data.copy_from_slice(&payload[..MAX_EVENT_INLINE]);
-            transport.queue_overflow(payload);
+        slot.reserved = 0;
+        match event {
+            TransportEvent::Connected(id) => {
+                slot.kind = EVENT_CONNECTED;
+                slot.connection = id.0;
+                slot.length = 0;
+            }
+            TransportEvent::Disconnected(id, reason) => {
+                slot.kind = EVENT_DISCONNECTED;
+                slot.connection = id.0;
+                let bytes = reason.as_bytes();
+                let length = bytes.len().min(MAX_EVENT_INLINE);
+                slot.length = length as u32;
+                slot.data[..length].copy_from_slice(&bytes[..length]);
+            }
+            TransportEvent::Received(id) => {
+                slot.kind = EVENT_RECEIVED;
+                slot.connection = id.0;
+                slot.length = payload.len() as u32;
+                if payload.len() <= MAX_EVENT_INLINE {
+                    slot.data[..payload.len()].copy_from_slice(&payload);
+                } else {
+                    slot.reserved = EVENT_OVERFLOW;
+                    slot.data.copy_from_slice(&payload[..MAX_EVENT_INLINE]);
+                    transport.queue_overflow(payload);
+                }
+            }
         }
         written += 1;
     }

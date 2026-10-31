@@ -10,3 +10,4 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 singularity-crypto = { workspace = true }
+socket2 = "0.6"

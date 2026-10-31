@@ -104,4 +104,4 @@ jobs:
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release --no-build -- --scene=all --ticks=60 --validate
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release --no-build -- --scene=all --ticks=60 --validate --strict --backend=rapier
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release --no-build -- --scene=all --ticks=60 --verify-sync
-      - run: dotnet test engine/Robust.Shared.IntegrationTests -c Release --filter FullyQualifiedName~SgTransport
+      - run: dotnet test engine/Robust.Shared.IntegrationTests -c Release --filter "FullyQualifiedName~SgTransport|FullyQualifiedName~NetManagerRealPair"
