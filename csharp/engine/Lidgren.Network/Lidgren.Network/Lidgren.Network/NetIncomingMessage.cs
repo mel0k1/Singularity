@@ -70,7 +70,7 @@ namespace Lidgren.Network
 		/// </summary>
 		public double ReceiveTime { get { return m_receiveTime; } }
 
-		internal NetIncomingMessage()
+		public NetIncomingMessage()
 		{
 		}
 

@@ -44,7 +44,7 @@ namespace Lidgren.Network
 		internal int m_fragmentChunkByteSize;	  // size, in bytes, of every chunk but the last one
 		internal int m_fragmentChunkNumber;       // which number chunk this is, starting with 0
 
-		internal NetOutgoingMessage()
+		public NetOutgoingMessage()
 		{
 		}
 

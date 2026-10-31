@@ -79,6 +79,9 @@ namespace Robust.Shared
         public static readonly CVarDef<int> NetRapidConnectionDecay =
             CVarDef.Create("net.rapid_connection_decay", 1, CVar.ARCHIVE);
 
+        public static readonly CVarDef<string> NetBackend =
+            CVarDef.Create("net.backend", "lidgren", CVar.ARCHIVE);
+
         /// <summary>
         /// UDP port to bind to for main game networking.
         /// Each address specified in <c>net.bindto</c> is bound with this port.

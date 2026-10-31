@@ -68,7 +68,7 @@ Research phase complete. The Robust Toolbox sources were studied subsystem by su
 
 1. `singularity-crypto` — done
 2. `singularity-physics` — done and in: `IPhysicsBackend` behind `SimulateWorld()`, rapier mirror measured in-situ (docs/physics-bench.md) — joints, pair filter, incremental collection and sleep tuning landed; prediction parity via the shared binary remains
-3. `singularity-net-transport` — seam spike done (docs/net-transport.md): UDP transport, event model, FFI and stop-and-wait reliability under measured loss; the Lidgren framer port is the next milestone
+3. `singularity-net-transport` — seam spike done (docs/net-transport.md): UDP transport, event model, FFI and stop-and-wait reliability under measured loss; the C# seam is in too — `INetChannel` over `sg_transport_*` behind `net.backend` (default `lidgren`), proven by a loopback pair test in CI; the Lidgren framer port is the next milestone
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
 5. C# core onboarding — done: engine vendored (`csharp/engine`), Farseer measured in-situ (`csharp/benches`), determinism confirmed
 

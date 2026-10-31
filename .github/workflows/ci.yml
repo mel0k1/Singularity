@@ -98,7 +98,10 @@ jobs:
           dotnet-version: 10.0.x
       - run: cargo build --release -p singularity-physics-ffi
         working-directory: rust
+      - run: cargo build --release -p singularity-net-transport
+        working-directory: rust
       - run: dotnet build benches/Singularity.PhysicsBench -c Release
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release --no-build -- --scene=all --ticks=60 --validate
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release --no-build -- --scene=all --ticks=60 --validate --strict --backend=rapier
       - run: dotnet run --project benches/Singularity.PhysicsBench -c Release --no-build -- --scene=all --ticks=60 --verify-sync
+      - run: dotnet test engine/Robust.Shared.IntegrationTests -c Release --filter FullyQualifiedName~SgTransportTest
