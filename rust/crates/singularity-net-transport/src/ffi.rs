@@ -316,6 +316,33 @@ pub unsafe extern "C" fn sg_transport_mtu(transport: *const UdpTransport) -> u32
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_transport_set_mtu_expand(
+    transport: *mut UdpTransport,
+    enabled: u32,
+    frequency_ms: u32,
+    fail_attempts: u32,
+) -> u32 {
+    if transport.is_null() {
+        return 0;
+    }
+    let enabled = enabled != 0;
+    let frequency = std::time::Duration::from_millis(u64::from(frequency_ms.max(1)));
+    unsafe { (*transport).set_mtu_expand(enabled, frequency, fail_attempts.max(1)) };
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_transport_connection_mtu(
+    transport: *const UdpTransport,
+    connection: u64,
+) -> u32 {
+    if transport.is_null() {
+        return 0;
+    }
+    unsafe { (*transport).connection_mtu(ConnectionId(connection)) as u32 }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sg_transport_set_timings(
     transport: *mut UdpTransport,
     ping_interval_ms: u32,

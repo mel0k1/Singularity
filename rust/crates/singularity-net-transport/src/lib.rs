@@ -5,8 +5,8 @@ mod protocol;
 mod wire;
 
 pub use channels::SendResult;
-pub use protocol::{FrameOut, NUM_CHANNELS, Protocol, Status, TransportConfig};
-pub use wire::MAX_GROUP_BYTES;
+pub use protocol::{FrameOut, MAX_PROBE_MTU, NUM_CHANNELS, Protocol, Status, TransportConfig};
+pub use wire::{MAX_GROUP_BYTES, MAX_MTU};
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -14,9 +14,9 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::MIN_MTU;
-use wire::{HEADER_BYTES, KIND_CONNECT, MAX_MTU};
+use wire::{HEADER_BYTES, KIND_CONNECT};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 pub const MAX_EVENT_INLINE: usize = 1200;
 pub const MAX_UNRELIABLE_BYTES: usize = 8191;
@@ -171,10 +171,30 @@ impl UdpTransport {
 
     pub fn set_mtu(&mut self, mtu: usize) {
         self.config.mtu = mtu.clamp(MIN_MTU, MAX_MTU);
+        let floor = self.config.mtu;
+        for connection in self.connections.values_mut() {
+            connection.protocol.reset_mtu_floor(floor);
+        }
     }
 
     pub fn mtu(&self) -> usize {
         self.config.mtu
+    }
+
+    pub fn set_mtu_expand(&mut self, enabled: bool, frequency: Duration, fail_attempts: u32) {
+        self.config.expand_mtu = enabled;
+        self.config.expand_mtu_frequency = frequency.max(Duration::from_millis(1));
+        self.config.expand_mtu_fail_attempts = fail_attempts.max(1);
+    }
+
+    pub fn connection_mtu(&self, conn: ConnectionId) -> usize {
+        let Some(addr) = self.by_id.get(&conn) else {
+            return self.config.mtu;
+        };
+        match self.connections.get(addr) {
+            Some(connection) => connection.protocol.current_mtu(&self.config),
+            None => self.config.mtu,
+        }
     }
 
     pub fn set_app_identifier(&mut self, app_identifier: &str) {
@@ -364,13 +384,15 @@ impl UdpTransport {
         }
         let now = Instant::now();
         let unique_id = self.unique_id;
-        let mut out = FrameOut::new(self.config.mtu);
+        let mut datagrams = Vec::new();
         if let Some(connection) = self.connections.get_mut(&from) {
+            let mut out = FrameOut::new(connection.protocol.current_mtu(&self.config));
             connection
                 .protocol
                 .handle_datagram(now, &self.config, unique_id, datagram, &mut out);
+            datagrams = out.take();
         }
-        for datagram in out.take() {
+        for datagram in datagrams {
             self.wire.send_datagram(from, &datagram);
         }
         self.collect_connection(from);
@@ -379,16 +401,17 @@ impl UdpTransport {
     fn pump_connection(&mut self, addr: SocketAddr) {
         let now = Instant::now();
         let unique_id = self.unique_id;
-        let mut out = FrameOut::new(self.config.mtu);
-        {
+        let datagrams = {
             let Some(connection) = self.connections.get_mut(&addr) else {
                 return;
             };
+            let mut out = FrameOut::new(connection.protocol.current_mtu(&self.config));
             connection
                 .protocol
                 .tick(now, &self.config, unique_id, &mut out);
-        }
-        for datagram in out.take() {
+            out.take()
+        };
+        for datagram in datagrams {
             self.wire.send_datagram(addr, &datagram);
         }
         self.collect_connection(addr);

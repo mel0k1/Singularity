@@ -20,6 +20,7 @@ use crate::wire::{
 pub const NUM_CHANNELS: usize = 99;
 pub const MAX_FRAGMENT_GROUPS: u32 = 65534;
 pub const MIN_MTU: usize = 64;
+pub const MAX_PROBE_MTU: usize = 8190;
 pub const DEFAULT_APP_IDENTIFIER: &str = "RobustToolbox";
 pub const DEFAULT_MTU: usize = 700;
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(1);
@@ -28,6 +29,8 @@ pub const DEFAULT_HANDSHAKE_INTERVAL: Duration = Duration::from_secs(3);
 pub const DEFAULT_MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
 pub const DEFAULT_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_REASSEMBLY_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_EXPAND_MTU_FREQUENCY: Duration = Duration::from_secs(2);
+pub const DEFAULT_EXPAND_MTU_FAIL_ATTEMPTS: u32 = 5;
 
 const UNUSED_KIND_FIRST: u8 = 99;
 const UNUSED_KIND_LAST: u8 = 127;
@@ -43,6 +46,9 @@ pub struct TransportConfig {
     pub max_handshake_attempts: u32,
     pub fragment_timeout: Duration,
     pub reassembly_bytes: usize,
+    pub expand_mtu: bool,
+    pub expand_mtu_frequency: Duration,
+    pub expand_mtu_fail_attempts: u32,
 }
 
 impl Default for TransportConfig {
@@ -57,6 +63,9 @@ impl Default for TransportConfig {
             max_handshake_attempts: DEFAULT_MAX_HANDSHAKE_ATTEMPTS,
             fragment_timeout: DEFAULT_FRAGMENT_TIMEOUT,
             reassembly_bytes: DEFAULT_REASSEMBLY_BYTES,
+            expand_mtu: false,
+            expand_mtu_frequency: DEFAULT_EXPAND_MTU_FREQUENCY,
+            expand_mtu_fail_attempts: DEFAULT_EXPAND_MTU_FAIL_ATTEMPTS,
         }
     }
 }
@@ -217,6 +226,50 @@ impl Reassembly {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MtuStatus {
+    Idle,
+    Probing,
+    Finished,
+}
+
+struct MtuState {
+    status: MtuStatus,
+    current: usize,
+    largest_successful: usize,
+    smallest_failed: Option<usize>,
+    last_sent_size: usize,
+    last_sent_at: Option<Instant>,
+    fails: u32,
+    discovered: bool,
+}
+
+impl MtuState {
+    fn fresh() -> MtuState {
+        MtuState {
+            status: MtuStatus::Idle,
+            current: 0,
+            largest_successful: 0,
+            smallest_failed: None,
+            last_sent_size: 0,
+            last_sent_at: None,
+            fails: 0,
+            discovered: false,
+        }
+    }
+
+    fn start(&mut self, floor: usize) {
+        self.status = MtuStatus::Idle;
+        self.current = floor;
+        self.largest_successful = floor;
+        self.smallest_failed = None;
+        self.last_sent_size = 0;
+        self.last_sent_at = None;
+        self.fails = 0;
+        self.discovered = false;
+    }
+}
+
 pub struct Protocol {
     pub initiator: bool,
     pub status: Status,
@@ -243,6 +296,7 @@ pub struct Protocol {
     released: Vec<Vec<u8>>,
     connected_pending: bool,
     dead_reason: Option<String>,
+    mtu: MtuState,
 }
 
 impl Protocol {
@@ -277,6 +331,7 @@ impl Protocol {
             released: Vec::new(),
             connected_pending: false,
             dead_reason: None,
+            mtu: MtuState::fresh(),
         }
     }
 
@@ -294,6 +349,22 @@ impl Protocol {
             if let Some(channel) = self.send_channels[slot].as_mut() {
                 channel.set_resend_delay(delay);
             }
+        }
+    }
+
+    pub fn current_mtu(&self, cfg: &TransportConfig) -> usize {
+        if self.mtu.current == 0 {
+            cfg.mtu.clamp(MIN_MTU, MAX_MTU)
+        } else {
+            self.mtu.current
+        }
+    }
+
+    pub fn reset_mtu_floor(&mut self, floor: usize) {
+        let floor = floor.clamp(MIN_MTU, MAX_MTU);
+        if self.mtu.status != MtuStatus::Probing && !self.mtu.discovered {
+            self.mtu.current = floor;
+            self.mtu.largest_successful = floor;
         }
     }
 
@@ -359,15 +430,16 @@ impl Protocol {
             Some(session) => session.encrypt(payload),
             None => payload.to_vec(),
         };
+        let mtu = self.current_mtu(cfg);
         let slot = (kind - 1) as usize;
-        if reliable && HEADER_BYTES + wire_payload.len() > cfg.mtu {
+        if reliable && HEADER_BYTES + wire_payload.len() > mtu {
             self.group_counter = if self.group_counter >= MAX_FRAGMENT_GROUPS {
                 1
             } else {
                 self.group_counter + 1
             };
             let group = self.group_counter;
-            let chunk_size = best_chunk_size(group, wire_payload.len(), cfg.mtu);
+            let chunk_size = best_chunk_size(group, wire_payload.len(), mtu);
             let total_bits = (wire_payload.len() * 8) as u32;
             let num_chunks = wire_payload.len().div_ceil(chunk_size);
             let data = Rc::new(wire_payload);
@@ -451,6 +523,7 @@ impl Protocol {
                 if now.duration_since(self.last_ping) >= cfg.ping_interval {
                     self.send_ping(now, out);
                 }
+                self.mtu_heartbeat(now, cfg, out);
             }
             Status::AwaitingConnect | Status::Dead => {}
         }
@@ -571,7 +644,7 @@ impl Protocol {
                     }
                     let payload = established_payload(self.local_time());
                     out.push_standalone(KIND_CONNECTION_ESTABLISHED, &payload);
-                    self.become_connected(now, out);
+                    self.become_connected(now, cfg, out);
                 }
                 Status::Connected => {
                     let payload = established_payload(self.local_time());
@@ -585,7 +658,7 @@ impl Protocol {
                         message.payload[..4].try_into().expect("four byte payload"),
                     );
                     self.init_remote_time_offset(remote_time);
-                    self.become_connected(now, out);
+                    self.become_connected(now, cfg, out);
                 }
             }
             KIND_DISCONNECT => {
@@ -623,10 +696,18 @@ impl Protocol {
             }
             KIND_EXPAND_MTU_REQUEST if self.status == Status::Connected => {
                 let size = message.payload.len();
-                if size > 0 && size <= MAX_MTU {
+                if size > 0 && size <= MAX_PROBE_MTU {
                     let payload = (size as u32).to_le_bytes();
                     out.push_standalone(KIND_EXPAND_MTU_SUCCESS, &payload);
                 }
+            }
+            KIND_EXPAND_MTU_SUCCESS
+                if self.status == Status::Connected && message.payload.len() == 4 =>
+            {
+                let size =
+                    u32::from_le_bytes(message.payload.try_into().expect("four byte payload"))
+                        as usize;
+                self.mtu_success(now, cfg, size, out);
             }
             _ => {}
         }
@@ -787,7 +868,7 @@ impl Protocol {
         out.push_standalone(KIND_CONNECT_RESPONSE, &payload);
     }
 
-    fn become_connected(&mut self, now: Instant, out: &mut FrameOut) {
+    fn become_connected(&mut self, now: Instant, cfg: &TransportConfig, out: &mut FrameOut) {
         if self.status == Status::Connected {
             return;
         }
@@ -795,7 +876,86 @@ impl Protocol {
         self.connected_pending = true;
         self.last_activity = now;
         self.timeout_grace = true;
+        self.mtu.start(cfg.mtu.clamp(MIN_MTU, MAX_MTU));
         self.send_ping(now, out);
+    }
+
+    fn mtu_heartbeat(&mut self, now: Instant, cfg: &TransportConfig, out: &mut FrameOut) {
+        if self.mtu.status == MtuStatus::Finished {
+            return;
+        }
+        if self.mtu.status == MtuStatus::Idle {
+            if !cfg.expand_mtu {
+                self.mtu_finalize(self.mtu.current);
+                return;
+            }
+            self.mtu.status = MtuStatus::Probing;
+            self.mtu_expand(now, cfg, out);
+            return;
+        }
+        let Some(last_sent_at) = self.mtu.last_sent_at else {
+            return;
+        };
+        if now > last_sent_at + cfg.expand_mtu_frequency {
+            self.mtu.fails += 1;
+            if self.mtu.fails >= cfg.expand_mtu_fail_attempts {
+                self.mtu_finalize(self.mtu.current);
+                return;
+            }
+            self.mtu.smallest_failed = Some(self.mtu.last_sent_size);
+            self.mtu_expand(now, cfg, out);
+        }
+    }
+
+    fn mtu_expand(&mut self, now: Instant, _cfg: &TransportConfig, out: &mut FrameOut) {
+        let try_mtu = match self.mtu.smallest_failed {
+            None => (self.mtu.current as f32 * 1.25) as usize,
+            Some(failed) => (failed + self.mtu.largest_successful) / 2,
+        }
+        .min(MAX_PROBE_MTU);
+        if try_mtu == self.mtu.largest_successful {
+            self.mtu_finalize(self.mtu.largest_successful);
+            return;
+        }
+        let probe = vec![0u8; try_mtu];
+        out.push_standalone(KIND_EXPAND_MTU_REQUEST, &probe);
+        self.mtu.last_sent_size = try_mtu;
+        self.mtu.last_sent_at = Some(now);
+    }
+
+    fn mtu_finalize(&mut self, size: usize) {
+        if self.mtu.status == MtuStatus::Finished {
+            return;
+        }
+        self.mtu.status = MtuStatus::Finished;
+        self.mtu.current = size;
+    }
+
+    fn mtu_success(
+        &mut self,
+        now: Instant,
+        cfg: &TransportConfig,
+        size: usize,
+        out: &mut FrameOut,
+    ) {
+        if self.mtu.status != MtuStatus::Probing {
+            return;
+        }
+        if size == 0 || size > MAX_PROBE_MTU {
+            return;
+        }
+        if size != self.mtu.last_sent_size {
+            return;
+        }
+        if size > self.mtu.largest_successful {
+            self.mtu.largest_successful = size;
+            self.mtu.discovered = true;
+        }
+        if size < self.mtu.current {
+            return;
+        }
+        self.mtu.current = size;
+        self.mtu_expand(now, cfg, out);
     }
 
     fn send_ping(&mut self, now: Instant, out: &mut FrameOut) {
@@ -851,7 +1011,36 @@ impl Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Cursor, KIND_ACKNOWLEDGE, KIND_RELIABLE_ORDERED_BASE, parse_ack_payload};
+    use crate::wire::{
+        Cursor, KIND_ACKNOWLEDGE, KIND_EXPAND_MTU_REQUEST, KIND_EXPAND_MTU_SUCCESS,
+        KIND_RELIABLE_ORDERED_BASE, parse_ack_payload, write_header,
+    };
+
+    fn library_frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; HEADER_BYTES];
+        write_header(&mut frame, kind, 0, false, (payload.len() * 8) as u16);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn expand_ready_protocol(now: Instant) -> (Protocol, TransportConfig) {
+        let cfg = TransportConfig {
+            expand_mtu: true,
+            ..TransportConfig::default()
+        };
+        let mut protocol = Protocol::new(true, now);
+        let mut out = FrameOut::new(700);
+        protocol.become_connected(now, &cfg, &mut out);
+        out.take();
+        (protocol, cfg)
+    }
+
+    fn probe_size(datagrams: &[Vec<u8>]) -> Option<usize> {
+        datagrams
+            .iter()
+            .find(|datagram| datagram[0] == KIND_EXPAND_MTU_REQUEST)
+            .map(|probe| probe.len() - HEADER_BYTES)
+    }
 
     #[test]
     fn acks_pack_into_lidgren_acknowledge_messages() {
@@ -907,6 +1096,159 @@ mod tests {
             assert_eq!(message.payload.len(), 10);
         }
         assert_eq!(seen, 4);
+    }
+
+    #[test]
+    fn mtu_probes_grow_by_a_quarter_and_honor_successes() {
+        let now = Instant::now();
+        let (mut protocol, cfg) = expand_ready_protocol(now);
+        let mut out = FrameOut::new(700);
+        protocol.tick(now, &cfg, 1, &mut out);
+        assert_eq!(probe_size(&out.take()), Some(875));
+
+        let mut out = FrameOut::new(700);
+        protocol.handle_datagram(
+            now,
+            &cfg,
+            1,
+            &library_frame(KIND_EXPAND_MTU_SUCCESS, &875u32.to_le_bytes()),
+            &mut out,
+        );
+        assert_eq!(protocol.current_mtu(&cfg), 875);
+        assert_eq!(probe_size(&out.take()), Some(1093));
+
+        let mut out = FrameOut::new(700);
+        protocol.handle_datagram(
+            now,
+            &cfg,
+            1,
+            &library_frame(KIND_EXPAND_MTU_SUCCESS, &1093u32.to_le_bytes()),
+            &mut out,
+        );
+        assert_eq!(protocol.current_mtu(&cfg), 1093);
+        assert_eq!(probe_size(&out.take()), Some(1366));
+    }
+
+    #[test]
+    fn mtu_success_with_unexpected_size_is_ignored() {
+        let now = Instant::now();
+        let (mut protocol, cfg) = expand_ready_protocol(now);
+        let mut out = FrameOut::new(700);
+        protocol.tick(now, &cfg, 1, &mut out);
+        out.take();
+
+        let mut out = FrameOut::new(700);
+        protocol.handle_datagram(
+            now,
+            &cfg,
+            1,
+            &library_frame(KIND_EXPAND_MTU_SUCCESS, &1093u32.to_le_bytes()),
+            &mut out,
+        );
+        assert_eq!(protocol.current_mtu(&cfg), 700);
+        assert_eq!(probe_size(&out.take()), None);
+    }
+
+    #[test]
+    fn mtu_probe_timeout_switches_to_binary_search() {
+        let start = Instant::now();
+        let (mut protocol, cfg) = expand_ready_protocol(start);
+        let mut out = FrameOut::new(700);
+        protocol.tick(start, &cfg, 1, &mut out);
+        assert_eq!(probe_size(&out.take()), Some(875));
+
+        let later = start + Duration::from_secs(3);
+        let mut out = FrameOut::new(700);
+        protocol.tick(later, &cfg, 1, &mut out);
+        assert_eq!(probe_size(&out.take()), Some(787));
+        assert_eq!(protocol.current_mtu(&cfg), 700);
+    }
+
+    #[test]
+    fn mtu_expansion_finalizes_after_fail_attempts() {
+        let start = Instant::now();
+        let (mut protocol, cfg) = expand_ready_protocol(start);
+        let mut out = FrameOut::new(700);
+        protocol.tick(start, &cfg, 1, &mut out);
+        out.take();
+
+        let mut now = start;
+        for _ in 0..cfg.expand_mtu_fail_attempts {
+            now += cfg.expand_mtu_frequency + Duration::from_millis(1);
+            let mut out = FrameOut::new(700);
+            protocol.tick(now, &cfg, 1, &mut out);
+            out.take();
+        }
+        assert_eq!(protocol.current_mtu(&cfg), 700);
+
+        now += cfg.expand_mtu_frequency + Duration::from_millis(1);
+        let mut out = FrameOut::new(700);
+        protocol.tick(now, &cfg, 1, &mut out);
+        assert_eq!(probe_size(&out.take()), None);
+    }
+
+    #[test]
+    fn mtu_expansion_climbs_to_protocol_max() {
+        let start = Instant::now();
+        let (mut protocol, cfg) = expand_ready_protocol(start);
+        let mut now = start;
+        let mut out = FrameOut::new(700);
+        protocol.tick(now, &cfg, 1, &mut out);
+        let Some(mut size) = probe_size(&out.take()) else {
+            panic!("first probe missing");
+        };
+        for _ in 0..64 {
+            let mut out = FrameOut::new(700);
+            protocol.handle_datagram(
+                now,
+                &cfg,
+                1,
+                &library_frame(KIND_EXPAND_MTU_SUCCESS, &(size as u32).to_le_bytes()),
+                &mut out,
+            );
+            let Some(next) = probe_size(&out.take()) else {
+                break;
+            };
+            size = next;
+            now += Duration::from_millis(10);
+        }
+        assert_eq!(protocol.current_mtu(&cfg), MAX_PROBE_MTU);
+    }
+
+    #[test]
+    fn mtu_stays_at_floor_when_expansion_is_disabled() {
+        let now = Instant::now();
+        let cfg = TransportConfig::default();
+        let mut protocol = Protocol::new(true, now);
+        let mut out = FrameOut::new(700);
+        protocol.become_connected(now, &cfg, &mut out);
+        out.take();
+
+        let mut out = FrameOut::new(700);
+        protocol.tick(now, &cfg, 1, &mut out);
+        assert_eq!(probe_size(&out.take()), None);
+        assert_eq!(protocol.current_mtu(&cfg), 700);
+
+        protocol.reset_mtu_floor(1200);
+        assert_eq!(protocol.current_mtu(&cfg), 1200);
+    }
+
+    #[test]
+    fn mtu_request_is_answered_with_success() {
+        let now = Instant::now();
+        let (mut protocol, cfg) = expand_ready_protocol(now);
+        let mut out = FrameOut::new(700);
+        protocol.handle_datagram(
+            now,
+            &cfg,
+            1,
+            &library_frame(KIND_EXPAND_MTU_REQUEST, &[0u8; 1200]),
+            &mut out,
+        );
+        let datagrams = out.take();
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0][0], KIND_EXPAND_MTU_SUCCESS);
+        assert_eq!(&datagrams[0][HEADER_BYTES..], &1200u32.to_le_bytes());
     }
 
     #[test]

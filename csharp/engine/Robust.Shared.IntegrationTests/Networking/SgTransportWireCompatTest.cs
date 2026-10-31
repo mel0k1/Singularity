@@ -120,6 +120,65 @@ internal sealed class SgTransportWireCompatTest : RobustIntegrationTest
         }
     }
 
+    [Test]
+    public async Task MtuExpansionInteropsWithNetServer()
+    {
+        var server = StartServer();
+        await server.WaitIdleAsync();
+        var serializer = server.ResolveDependency<IRobustSerializer>();
+
+        var config = new NetPeerConfiguration("RobustToolbox")
+        {
+            AcceptIncomingConnections = true,
+            MaximumConnections = 8,
+            PingInterval = 0.25f,
+            ConnectionTimeout = 20f,
+            MaximumTransmissionUnit = 700,
+            AutoExpandMTU = true,
+            ExpandMTUFrequency = 0.25f,
+            ExpandMTUFailAttempts = 5,
+        };
+        config.EnableMessageType(NetIncomingMessageType.ConnectionApproval);
+
+        var netServer = new NetServer(config);
+        netServer.Start();
+        try
+        {
+            var state = new ServerState();
+            var host = new RawHost();
+            using var clientTransport = SgTransport.Bind(host, serializer, new IPEndPoint(IPAddress.Loopback, 0));
+            clientTransport.SetTimings(TimeSpan.FromMilliseconds(100), TimeSpan.FromSeconds(20), TimeSpan.Zero);
+            clientTransport.SetMtuExpand(true, TimeSpan.FromMilliseconds(250), 5);
+
+            var channel = clientTransport.Connect(new IPEndPoint(IPAddress.Loopback, netServer.Port));
+            var connectionId = (ulong) channel.ConnectionId;
+
+            Assert.That(PumpUntil(() => channel.IsConnected && state.Connected, clientTransport, netServer, state), Is.True);
+            Assert.That(state.Connection, Is.Not.Null);
+
+            Assert.That(
+                PumpUntil(
+                    () => clientTransport.ConnectionMtu(connectionId) >= 8190
+                        && state.Connection!.CurrentMTU >= 8190,
+                    clientTransport,
+                    netServer,
+                    state),
+                Is.True,
+                "mtu expansion never converged against the lidgren server");
+
+            Assert.That(clientTransport.ConnectionMtu(connectionId), Is.EqualTo(8190));
+            Assert.That(state.Connection!.CurrentMTU, Is.EqualTo(8190));
+
+            channel.Disconnect("mtu bye");
+            Assert.That(PumpUntil(() => state.Disconnected, clientTransport, netServer, state), Is.True);
+            Assert.That(state.DisconnectReason, Is.EqualTo("mtu bye"));
+        }
+        finally
+        {
+            netServer.Shutdown("test over");
+        }
+    }
+
     private static NetPeerConfiguration BuildConfig()
     {
         var config = new NetPeerConfiguration("RobustToolbox")

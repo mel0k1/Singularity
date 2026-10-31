@@ -8,7 +8,7 @@ namespace Robust.Shared.Network.Transport;
 
 internal static class SgTransportNative
 {
-    public const uint AbiVersion = 3;
+    public const uint AbiVersion = 4;
 
     public const uint EventConnected = 0;
     public const uint EventDisconnected = 1;
@@ -169,6 +169,16 @@ internal static class SgTransportNative
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern uint sg_transport_mtu(IntPtr transport);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_set_mtu_expand(
+        IntPtr transport,
+        uint enabled,
+        uint frequencyMs,
+        uint failAttempts);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_connection_mtu(IntPtr transport, ulong connection);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern uint sg_transport_set_timings(

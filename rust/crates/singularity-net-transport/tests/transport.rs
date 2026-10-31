@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use singularity_net_transport::ffi::*;
 use singularity_net_transport::{
-    ConnectionId, Delivery, MAX_GROUP_BYTES, MAX_UNRELIABLE_BYTES, TransportEvent, UdpTransport,
+    ConnectionId, Delivery, MAX_GROUP_BYTES, MAX_PROBE_MTU, MAX_UNRELIABLE_BYTES, TransportEvent,
+    UdpTransport,
 };
 
 struct Pair {
@@ -613,4 +614,102 @@ fn reliable_burst_far_past_window_stays_alive() {
     let ordered: Vec<u32> = (0..count).collect();
     assert_eq!(seen, ordered, "burst order broken");
     assert!(pair.server.stats().connections == 1);
+}
+
+#[test]
+fn mtu_expansion_negotiates_on_both_ends() {
+    let mut pair = Pair::new();
+    pair.server
+        .set_mtu_expand(true, Duration::from_millis(200), 5);
+    pair.client
+        .set_mtu_expand(true, Duration::from_millis(200), 5);
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+    let server_conn = pair.server_conn.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (pair.client.connection_mtu(conn) < MAX_PROBE_MTU
+        || pair.server.connection_mtu(server_conn) < MAX_PROBE_MTU)
+        && Instant::now() < deadline
+    {
+        pair.step();
+        sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(pair.client.connection_mtu(conn), MAX_PROBE_MTU);
+    assert_eq!(pair.server.connection_mtu(server_conn), MAX_PROBE_MTU);
+}
+
+#[test]
+fn mtu_stays_at_floor_without_expansion() {
+    let mut pair = Pair::new();
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+
+    for _ in 0..20 {
+        pair.step();
+        sleep(Duration::from_millis(2));
+    }
+    assert_eq!(pair.client.connection_mtu(conn), 700);
+    assert_eq!(pair.server.connection_mtu(pair.server_conn.unwrap()), 700);
+
+    pair.client.set_mtu(1200);
+    assert_eq!(pair.client.connection_mtu(conn), 1200);
+    assert_eq!(pair.client.mtu(), 1200);
+}
+
+#[test]
+fn expanded_mtu_shrinks_fragment_datagram_count() {
+    let mut pair = Pair::new();
+    pair.server
+        .set_mtu_expand(true, Duration::from_millis(200), 5);
+    pair.client
+        .set_mtu_expand(true, Duration::from_millis(200), 5);
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+    let server_conn = pair.server_conn.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (pair.client.connection_mtu(conn) < MAX_PROBE_MTU
+        || pair.server.connection_mtu(server_conn) < MAX_PROBE_MTU)
+        && Instant::now() < deadline
+    {
+        pair.step();
+        sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pair.client.connection_mtu(conn), MAX_PROBE_MTU);
+
+    let before = pair.client.stats().datagrams_sent;
+    let mut payload = vec![0u8; 16 * 1024];
+    for (i, byte) in payload.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    assert!(pair.client.send(conn, Delivery::ReliableOrdered, &payload));
+
+    let mut received = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while received.is_none() && Instant::now() < deadline {
+        pair.step();
+        for (event, data) in pair.server_events.drain(..) {
+            if let TransportEvent::Received(_) = event
+                && data.len() == payload.len()
+            {
+                received = Some(data);
+            }
+        }
+    }
+
+    assert_eq!(
+        received.as_ref(),
+        Some(&payload),
+        "fragmented payload broken"
+    );
+    let delta = pair.client.stats().datagrams_sent - before;
+    assert!(
+        delta <= 10,
+        "expected few fragment datagrams at expanded mtu, got {delta}"
+    );
 }

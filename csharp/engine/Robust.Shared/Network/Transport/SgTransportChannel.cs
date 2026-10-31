@@ -52,7 +52,7 @@ public sealed class SgTransportChannel : INetChannel
 
     public bool IsHandshakeComplete { get; set; }
 
-    public int CurrentMtu => _transport.Mtu;
+    public int CurrentMtu => _transport.ConnectionMtu(_connection);
 
     internal void MarkEstablished()
     {

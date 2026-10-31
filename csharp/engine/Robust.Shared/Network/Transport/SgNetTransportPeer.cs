@@ -105,6 +105,14 @@ internal sealed class SgNetTransportPeer : INetTransportPeer
         _settings = settings;
         SgTransportNative.sg_transport_set_app_identifier(_handle, settings.AppIdentifier);
         SgTransportNative.sg_transport_set_mtu(_handle, checked((uint) Math.Max(1, settings.Mtu)));
+        var expandFrequencyMs = Math.Max(
+            1,
+            (uint) TimeSpan.FromSeconds(Math.Max(0.001f, settings.MtuExpandFrequency)).TotalMilliseconds);
+        SgTransportNative.sg_transport_set_mtu_expand(
+            _handle,
+            settings.MtuExpand ? 1u : 0u,
+            expandFrequencyMs,
+            checked((uint) Math.Max(1, settings.MtuExpandFailAttempts)));
         var pingMs = Math.Max(1, (uint) TimeSpan.FromSeconds(settings.PingInterval).TotalMilliseconds);
         var timeoutMs = Math.Max(1, (uint) TimeSpan.FromSeconds(settings.ConnectionTimeout).TotalMilliseconds);
         SgTransportNative.sg_transport_set_timings(_handle, pingMs, timeoutMs, 0);
@@ -296,7 +304,7 @@ internal sealed class SgNetTransportConnection : INetTransportConnection
 
     public float RemoteTimeOffset => SgTransportNative.sg_transport_time_offset(_peer.HandleForQueries, _id);
 
-    public int CurrentMtu => checked((int) SgTransportNative.sg_transport_mtu(_peer.HandleForQueries));
+    public int CurrentMtu => checked((int) SgTransportNative.sg_transport_connection_mtu(_peer.HandleForQueries, _id));
 
     public NetConnectionStatus Status => _status;
 

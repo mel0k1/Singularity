@@ -287,6 +287,10 @@ namespace Robust.Shared.Network
             _config.OnValueChanged(CVars.NetRapidConnectionDecay, RapidConnectionDecayChanged);
             _config.OnValueChanged(CVars.NetMaxFragmentReassemblyBytesPerConnection, MaxFragmentReassemblyBytesPerConnectionChanged);
             _config.OnValueChanged(CVars.NetFragmentGroupTimeout, FragmentGroupTimeoutChanged);
+            _config.OnValueChanged(CVars.NetMtu, MtuChanged);
+            _config.OnValueChanged(CVars.NetMtuExpand, MtuExpandChanged);
+            _config.OnValueChanged(CVars.NetMtuExpandFrequency, MtuExpandFrequencyChanged);
+            _config.OnValueChanged(CVars.NetMtuExpandFailAttempts, MtuExpandFailAttemptsChanged);
 
             _config.OnValueChanged(CVars.NetVerbose, NetVerboseChanged);
             _config.OnValueChanged(CVars.NetLogging, NetLoggingChanged);
@@ -388,12 +392,35 @@ namespace Robust.Shared.Network
             ApplyTransportSettings();
         }
 
+        private void MtuChanged(int mtu)
+        {
+            ApplyTransportSettings();
+        }
+
+        private void MtuExpandChanged(bool expand)
+        {
+            ApplyTransportSettings();
+        }
+
+        private void MtuExpandFrequencyChanged(float frequency)
+        {
+            ApplyTransportSettings();
+        }
+
+        private void MtuExpandFailAttemptsChanged(int attempts)
+        {
+            ApplyTransportSettings();
+        }
+
         private NetTransportSettings BuildTransportSettings()
         {
             return new NetTransportSettings
             {
                 AppIdentifier = _config.GetCVar(CVars.NetLidgrenAppIdentifier),
                 Mtu = _config.GetCVar(CVars.NetMtu),
+                MtuExpand = _config.GetCVar(CVars.NetMtuExpand),
+                MtuExpandFrequency = _config.GetCVar(CVars.NetMtuExpandFrequency),
+                MtuExpandFailAttempts = _config.GetCVar(CVars.NetMtuExpandFailAttempts),
                 PingInterval = 1f,
                 ConnectionTimeout = _config.GetCVar(CVars.NetConnectionTimeout),
                 MaxIpConnections = _config.GetCVar(CVars.NetMaxIpConnections),
@@ -629,6 +656,10 @@ namespace Robust.Shared.Network
             _config.UnsubValueChanged(CVars.NetRapidConnectionDecay, RapidConnectionDecayChanged);
             _config.UnsubValueChanged(CVars.NetMaxFragmentReassemblyBytesPerConnection, MaxFragmentReassemblyBytesPerConnectionChanged);
             _config.UnsubValueChanged(CVars.NetFragmentGroupTimeout, FragmentGroupTimeoutChanged);
+            _config.UnsubValueChanged(CVars.NetMtu, MtuChanged);
+            _config.UnsubValueChanged(CVars.NetMtuExpand, MtuExpandChanged);
+            _config.UnsubValueChanged(CVars.NetMtuExpandFrequency, MtuExpandFrequencyChanged);
+            _config.UnsubValueChanged(CVars.NetMtuExpandFailAttempts, MtuExpandFailAttemptsChanged);
 
             _serializer.ClientHandshakeComplete -= OnSerializerOnClientHandshakeComplete;
 

@@ -54,6 +54,13 @@ public sealed class SgTransport : IDisposable
 
     public int Mtu => _handle == IntPtr.Zero ? 0 : checked((int) SgTransportNative.sg_transport_mtu(_handle));
 
+    public int ConnectionMtu(ulong connection)
+    {
+        return _handle == IntPtr.Zero
+            ? 0
+            : checked((int) SgTransportNative.sg_transport_connection_mtu(_handle, connection));
+    }
+
     public IReadOnlyCollection<SgTransportChannel> Channels => _channels.Values;
 
     internal ISgTransportHost Host => _host;
@@ -68,6 +75,15 @@ public sealed class SgTransport : IDisposable
     public void SetMtu(int mtu)
     {
         SgTransportNative.sg_transport_set_mtu(_handle, checked((uint) mtu));
+    }
+
+    public void SetMtuExpand(bool enabled, TimeSpan frequency, int failAttempts)
+    {
+        SgTransportNative.sg_transport_set_mtu_expand(
+            _handle,
+            enabled ? 1u : 0u,
+            Math.Max(1, (uint) frequency.TotalMilliseconds),
+            checked((uint) Math.Max(1, failAttempts)));
     }
 
     public void SetTimings(TimeSpan pingInterval, TimeSpan timeout, TimeSpan resendDelay)

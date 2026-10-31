@@ -49,6 +49,9 @@ internal struct NetTransportSettings
 {
     public string AppIdentifier;
     public int Mtu;
+    public bool MtuExpand;
+    public float MtuExpandFrequency;
+    public int MtuExpandFailAttempts;
     public float PingInterval;
     public float ConnectionTimeout;
     public int MaxIpConnections;
@@ -168,8 +171,11 @@ internal sealed class LidgrenTransportPeer : INetTransportPeer
                 settings.Mtu,
                 1,
                 (ushort.MaxValue + 1) / 8 - 1);
+            config.AutoExpandMTU = settings.MtuExpand;
         }
 
+        config.ExpandMTUFrequency = Math.Max(0.01f, settings.MtuExpandFrequency);
+        config.ExpandMTUFailAttempts = Math.Max(1, settings.MtuExpandFailAttempts);
         config.PingInterval = settings.PingInterval;
         config.ConnectionTimeout = settings.ConnectionTimeout;
         config.MaximumIpConnections = settings.MaxIpConnections;
