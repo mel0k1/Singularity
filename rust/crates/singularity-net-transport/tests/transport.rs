@@ -332,6 +332,16 @@ fn ffi_surface_end_to_end() {
         }
         assert!(client_connected && server_connected);
 
+        let client_port = sg_transport_local_port(client);
+        let mut endpoint = [0i8; 64];
+        assert_eq!(
+            sg_transport_remote_endpoint(server, conn, endpoint.as_mut_ptr(), endpoint.len()),
+            1
+        );
+        let end = endpoint.iter().position(|&c| c == 0).unwrap();
+        let text: String = endpoint[..end].iter().map(|&c| c as u8 as char).collect();
+        assert_eq!(text, format!("127.0.0.1:{client_port}"));
+
         assert_eq!(
             sg_transport_send(client, conn, DELIVERY_UNRELIABLE, b"hello ffi".as_ptr(), 9),
             1

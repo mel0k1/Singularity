@@ -144,6 +144,10 @@ impl UdpTransport {
         self.wire.socket.local_addr()
     }
 
+    pub fn remote_endpoint(&self, conn: ConnectionId) -> Option<SocketAddr> {
+        self.by_id.get(&conn).copied()
+    }
+
     pub fn set_timings(&mut self, heartbeat: Duration, timeout: Duration, rto: Duration) {
         self.heartbeat = heartbeat;
         self.timeout = timeout;

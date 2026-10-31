@@ -68,6 +68,31 @@ pub unsafe extern "C" fn sg_transport_bind(addr: *const c_char) -> *mut UdpTrans
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_transport_remote_endpoint(
+    transport: *const UdpTransport,
+    connection: u64,
+    out: *mut c_char,
+    cap: usize,
+) -> u32 {
+    if transport.is_null() || out.is_null() || cap == 0 {
+        return 0;
+    }
+    let Some(endpoint) = (unsafe { (*transport).remote_endpoint(ConnectionId(connection)) }) else {
+        return 0;
+    };
+    let text = endpoint.to_string();
+    let bytes = text.as_bytes();
+    if bytes.len() + 1 > cap {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast(), bytes.len());
+        *out.add(bytes.len()) = 0;
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sg_transport_destroy(transport: *mut UdpTransport) {
     if !transport.is_null() {
         unsafe { drop(Box::from_raw(transport)) };
