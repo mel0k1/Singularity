@@ -1,9 +1,7 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use singularity_net_transport::{
-    ConnectionId, Delivery, MAX_DATAGRAM, TransportEvent, UdpTransport,
-};
+use singularity_net_transport::{ConnectionId, Delivery, TransportEvent, UdpTransport};
 
 fn main() {
     let mut server = UdpTransport::bind("127.0.0.1:0").unwrap();
@@ -21,7 +19,7 @@ fn main() {
         &mut client_events,
     );
 
-    for payload_len in [64usize, 512, MAX_DATAGRAM] {
+    for payload_len in [64usize, 512, 1200] {
         bench_unreliable(
             &mut server,
             &mut client,
@@ -146,7 +144,7 @@ fn bench_reliable(
     }
     let elapsed = start.elapsed();
     println!(
-        "reliable   {}B: {} msgs, {} delivered, {:.0} msgs/s (stop-and-wait)",
+        "reliable   {}B: {} msgs, {} delivered, {:.0} msgs/s (window 64)",
         payload_len,
         count,
         received,
@@ -166,7 +164,7 @@ fn bench_send_call_overhead(client: &mut UdpTransport, conn: ConnectionId) {
     }
     let elapsed = start.elapsed();
     println!(
-        "send() call: {} accepted of {}, {:.0} ns/call",
+        "send() enqueue: {} accepted of {}, {:.0} ns/call",
         accepted,
         iterations,
         elapsed.as_nanos() as f64 / iterations as f64

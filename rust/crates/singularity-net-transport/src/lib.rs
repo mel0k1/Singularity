@@ -1,34 +1,42 @@
 pub mod ffi;
 
-use std::collections::HashMap;
+mod channels;
+mod protocol;
+mod wire;
+
+pub use channels::SendResult;
+pub use protocol::{FrameOut, NUM_CHANNELS, Protocol, Status, TransportConfig};
+pub use wire::MAX_GROUP_BYTES;
+
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const ABI_VERSION: u32 = 1;
+use protocol::MIN_MTU;
+use wire::{HEADER_BYTES, KIND_CONNECT, MAX_MTU};
 
-pub const MAX_DATAGRAM: usize = 1200;
+pub const ABI_VERSION: u32 = 2;
 
-pub const KIND_PAYLOAD_UNRELIABLE: u8 = 0;
-pub const KIND_PAYLOAD_RELIABLE: u8 = 1;
-pub const KIND_ACK: u8 = 2;
-pub const KIND_HELLO: u8 = 3;
-pub const KIND_HELLO_ACK: u8 = 4;
-pub const KIND_DISCONNECT: u8 = 5;
-pub const KIND_HEARTBEAT: u8 = 6;
-
-pub const HEADER_BYTES: usize = 9;
-
-pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(100);
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
-pub const DEFAULT_RTO: Duration = Duration::from_millis(60);
+pub const MAX_EVENT_INLINE: usize = 1200;
+pub const MAX_UNRELIABLE_BYTES: usize = 8191;
 
 const POLL_BURST: usize = 256;
+const RECV_BUFFER: usize = 65536;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Delivery {
-    Unreliable,
-    ReliableOrdered,
+    Unreliable = 1,
+    UnreliableSequenced = 2,
+    ReliableUnordered = 34,
+    ReliableSequenced = 35,
+    ReliableOrdered = 67,
+}
+
+impl Delivery {
+    pub fn kind(self, sequence_channel: u8) -> u8 {
+        self as u8 + sequence_channel
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -54,26 +62,21 @@ pub struct TransportStats {
 
 struct Wire {
     socket: UdpSocket,
-    send_buffer: Vec<u8>,
     stats: TransportStats,
     loss_rate: f32,
     rng: u64,
 }
 
 impl Wire {
-    fn send(&mut self, addr: SocketAddr, kind: u8, seq: u64, payload: &[u8]) -> bool {
+    fn send_datagram(&mut self, addr: SocketAddr, datagram: &[u8]) -> bool {
         if self.should_drop() {
             self.stats.datagrams_dropped += 1;
             return false;
         }
-        self.send_buffer.clear();
-        self.send_buffer.push(kind);
-        self.send_buffer.extend_from_slice(&seq.to_le_bytes());
-        self.send_buffer.extend_from_slice(payload);
-        match self.socket.send_to(&self.send_buffer, addr) {
+        match self.socket.send_to(datagram, addr) {
             Ok(_) => {
                 self.stats.datagrams_sent += 1;
-                self.stats.bytes_sent += self.send_buffer.len() as u64;
+                self.stats.bytes_sent += datagram.len() as u64;
                 true
             }
             Err(_) => false,
@@ -94,15 +97,7 @@ impl Wire {
 
 struct Connection {
     id: ConnectionId,
-    outgoing: u64,
-    reliable_outgoing: u64,
-    expected_incoming: u64,
-    pending: Option<(u64, Vec<u8>, Instant)>,
-    outbox: Vec<Vec<u8>>,
-    last_received: Instant,
-    last_heartbeat: Instant,
-    established: bool,
-    closed: bool,
+    protocol: Protocol,
 }
 
 pub struct UdpTransport {
@@ -111,10 +106,11 @@ pub struct UdpTransport {
     by_id: HashMap<ConnectionId, SocketAddr>,
     next_id: u64,
     events: Vec<(TransportEvent, Vec<u8>)>,
+    overflow: VecDeque<Vec<u8>>,
+    reasons: HashMap<ConnectionId, String>,
+    config: TransportConfig,
+    unique_id: u64,
     recv_buffer: Vec<u8>,
-    heartbeat: Duration,
-    timeout: Duration,
-    rto: Duration,
 }
 
 impl UdpTransport {
@@ -124,7 +120,6 @@ impl UdpTransport {
         Ok(UdpTransport {
             wire: Wire {
                 socket,
-                send_buffer: Vec::new(),
                 stats: TransportStats::default(),
                 loss_rate: 0.0,
                 rng: 0x9e3779b97f4a7c15,
@@ -133,10 +128,11 @@ impl UdpTransport {
             by_id: HashMap::new(),
             next_id: 1,
             events: Vec::new(),
-            recv_buffer: vec![0u8; MAX_DATAGRAM + HEADER_BYTES],
-            heartbeat: DEFAULT_HEARTBEAT,
-            timeout: DEFAULT_TIMEOUT,
-            rto: DEFAULT_RTO,
+            overflow: VecDeque::new(),
+            reasons: HashMap::new(),
+            config: TransportConfig::default(),
+            unique_id: unique_identifier(),
+            recv_buffer: vec![0u8; RECV_BUFFER],
         })
     }
 
@@ -148,10 +144,36 @@ impl UdpTransport {
         self.by_id.get(&conn).copied()
     }
 
-    pub fn set_timings(&mut self, heartbeat: Duration, timeout: Duration, rto: Duration) {
-        self.heartbeat = heartbeat;
-        self.timeout = timeout;
-        self.rto = rto;
+    pub fn set_timings(
+        &mut self,
+        ping_interval: Duration,
+        timeout: Duration,
+        resend_delay: Duration,
+    ) {
+        self.config.ping_interval = ping_interval;
+        self.config.timeout = timeout;
+        self.config.resend_delay = if resend_delay.is_zero() {
+            None
+        } else {
+            Some(resend_delay)
+        };
+        if let Some(delay) = self.config.resend_delay {
+            for connection in self.connections.values_mut() {
+                connection.protocol.set_resend_delay(delay);
+            }
+        }
+    }
+
+    pub fn set_mtu(&mut self, mtu: usize) {
+        self.config.mtu = mtu.clamp(MIN_MTU, MAX_MTU);
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.config.mtu
+    }
+
+    pub fn set_app_identifier(&mut self, app_identifier: &str) {
+        self.config.app_identifier = app_identifier.to_owned();
     }
 
     pub fn set_loss_rate(&mut self, rate: f32) {
@@ -161,55 +183,99 @@ impl UdpTransport {
     pub fn connect(&mut self, addr: SocketAddr) -> ConnectionId {
         let id = ConnectionId(self.next_id);
         self.next_id += 1;
-        let now = Instant::now();
         self.connections.insert(
             addr,
             Connection {
                 id,
-                outgoing: 0,
-                reliable_outgoing: 0,
-                expected_incoming: 0,
-                pending: None,
-                outbox: Vec::new(),
-                last_received: now,
-                last_heartbeat: now,
-                established: false,
-                closed: false,
+                protocol: Protocol::new(true, Instant::now()),
             },
         );
         self.by_id.insert(id, addr);
-        self.wire.send(addr, KIND_HELLO, 0, &[]);
         id
     }
 
     pub fn send(&mut self, conn: ConnectionId, delivery: Delivery, payload: &[u8]) -> bool {
+        self.send_kind(conn, delivery.kind(0), payload)
+    }
+
+    pub fn send_kind(&mut self, conn: ConnectionId, kind: u8, payload: &[u8]) -> bool {
         let Some(addr) = self.by_id.get(&conn).copied() else {
             return false;
         };
-        let Some(connection) = self.connections.get_mut(&addr) else {
+        let result = match self.connections.get_mut(&addr) {
+            Some(connection) => connection.protocol.send_user(&self.config, kind, payload),
+            None => return false,
+        };
+        matches!(result, SendResult::Sent | SendResult::Queued)
+    }
+
+    pub fn set_key(&mut self, conn: ConnectionId, key: &[u8; 32]) -> bool {
+        let Some(addr) = self.by_id.get(&conn).copied() else {
             return false;
         };
-        if connection.closed || payload.len() > MAX_DATAGRAM {
-            return false;
-        }
-
-        match delivery {
-            Delivery::ReliableOrdered => {
-                connection.outbox.push(payload.to_vec());
+        match self.connections.get_mut(&addr) {
+            Some(connection) => {
+                connection.protocol.set_key(key);
+                true
             }
-            Delivery::Unreliable => {
-                let seq = connection.outgoing;
-                connection.outgoing += 1;
-                return self.wire.send(addr, KIND_PAYLOAD_UNRELIABLE, seq, payload);
-            }
+            None => false,
         }
+    }
 
-        self.pump_connection(addr);
-        true
+    pub fn close(&mut self, conn: ConnectionId) {
+        self.disconnect(conn, "Disconnected");
+    }
+
+    pub fn disconnect(&mut self, conn: ConnectionId, reason: &str) {
+        self.disconnect_with(conn, reason, true);
+    }
+
+    pub fn disconnect_with(&mut self, conn: ConnectionId, reason: &str, send_bye: bool) {
+        let Some(addr) = self.by_id.get(&conn).copied() else {
+            return;
+        };
+        let mut out = FrameOut::new(self.config.mtu);
+        if let Some(connection) = self.connections.get_mut(&addr) {
+            connection.protocol.disconnect(reason, send_bye, &mut out);
+        }
+        for datagram in out.take() {
+            self.wire.send_datagram(addr, &datagram);
+        }
+        if let Some(connection) = self.connections.remove(&addr) {
+            self.by_id.remove(&connection.id);
+            self.reasons.insert(connection.id, reason.to_owned());
+            self.events
+                .push((TransportEvent::Disconnected(connection.id), Vec::new()));
+        }
+    }
+
+    pub fn rtt(&self, conn: ConnectionId) -> f32 {
+        let Some(addr) = self.by_id.get(&conn) else {
+            return -1.0;
+        };
+        match self.connections.get(addr) {
+            Some(connection) => connection.protocol.rtt(),
+            None => -1.0,
+        }
+    }
+
+    pub fn time_offset(&self, conn: ConnectionId) -> f32 {
+        let Some(addr) = self.by_id.get(&conn) else {
+            return 0.0;
+        };
+        match self.connections.get(addr) {
+            Some(connection) => connection.protocol.time_offset(),
+            None => 0.0,
+        }
+    }
+
+    pub fn disconnect_reason(&self, conn: ConnectionId) -> Option<&str> {
+        self.reasons.get(&conn).map(String::as_str)
     }
 
     pub fn poll(&mut self, out: &mut Vec<(TransportEvent, Vec<u8>)>) {
         out.clear();
+        self.reasons.clear();
         loop {
             let mut drained = 0;
             for _ in 0..POLL_BURST {
@@ -220,14 +286,13 @@ impl UdpTransport {
                 };
                 drained += 1;
                 let datagram = self.recv_buffer[..len].to_vec();
-                self.handle_datagram(from, &datagram);
+                self.route_datagram(from, &datagram);
             }
 
             let addresses: Vec<SocketAddr> = self.connections.keys().copied().collect();
             for addr in addresses {
                 self.pump_connection(addr);
             }
-            self.check_timeouts();
 
             if drained < POLL_BURST {
                 break;
@@ -238,204 +303,124 @@ impl UdpTransport {
         self.events.clear();
     }
 
-    pub fn close(&mut self, conn: ConnectionId) {
-        let Some(addr) = self.by_id.get(&conn).copied() else {
-            return;
-        };
-        self.wire.send(addr, KIND_DISCONNECT, 0, &[]);
-        self.remove_connection(addr);
-    }
-
     pub fn stats(&self) -> TransportStats {
         let mut stats = self.wire.stats;
         stats.connections = self.connections.len() as u32;
+        stats.retransmits = self
+            .connections
+            .values()
+            .map(|connection| connection.protocol.retransmits)
+            .sum();
         stats
     }
 
-    fn pump_connection(&mut self, addr: SocketAddr) {
-        let now = Instant::now();
-        let mut action = PumpAction::Idle;
-        let mut beat = false;
-        {
-            let Some(connection) = self.connections.get_mut(&addr) else {
-                return;
-            };
-            if connection.closed {
-                return;
-            }
-            if let Some((seq, payload, last_sent)) = connection.pending.as_mut() {
-                if now.duration_since(*last_sent) >= self.rto {
-                    *last_sent = now;
-                    action = PumpAction::Resend(*seq, payload.clone());
-                }
-            } else if let Some(payload) = connection.outbox.first().cloned() {
-                let seq = connection.reliable_outgoing;
-                connection.reliable_outgoing += 1;
-                connection.outbox.remove(0);
-                connection.pending = Some((seq, payload.clone(), now));
-                action = PumpAction::Send(seq, payload);
-            }
-
-            if now.duration_since(connection.last_heartbeat) >= self.heartbeat {
-                connection.last_heartbeat = now;
-                beat = true;
-            }
-        }
-
-        match action {
-            PumpAction::Send(seq, payload) => {
-                self.wire.send(addr, KIND_PAYLOAD_RELIABLE, seq, &payload);
-            }
-            PumpAction::Resend(seq, payload) => {
-                self.wire.stats.retransmits += 1;
-                self.wire.send(addr, KIND_PAYLOAD_RELIABLE, seq, &payload);
-            }
-            PumpAction::Idle => {}
-        }
-
-        if beat {
-            self.wire.send(addr, KIND_HEARTBEAT, 0, &[]);
-        }
+    pub fn queue_overflow(&mut self, payload: Vec<u8>) {
+        self.overflow.push_back(payload);
     }
 
-    fn check_timeouts(&mut self) {
-        let now = Instant::now();
-        let expired: Vec<SocketAddr> = self
-            .connections
-            .iter()
-            .filter(|(_, connection)| now.duration_since(connection.last_received) >= self.timeout)
-            .map(|(addr, _)| *addr)
-            .collect();
-        for addr in expired {
-            self.remove_connection(addr);
+    pub fn fetch_overflow(&mut self, buf: &mut [u8]) -> usize {
+        let Some(payload) = self.overflow.front() else {
+            return 0;
+        };
+        if payload.len() > buf.len() {
+            return payload.len();
         }
+        let payload = self.overflow.pop_front().expect("front checked");
+        buf[..payload.len()].copy_from_slice(&payload);
+        payload.len()
     }
 
-    fn remove_connection(&mut self, addr: SocketAddr) {
-        if let Some(connection) = self.connections.remove(&addr) {
-            self.by_id.remove(&connection.id);
-            self.events
-                .push((TransportEvent::Disconnected(connection.id), Vec::new()));
-        }
-    }
-
-    fn handle_datagram(&mut self, from: SocketAddr, datagram: &[u8]) {
+    fn route_datagram(&mut self, from: SocketAddr, datagram: &[u8]) {
         self.wire.stats.datagrams_received += 1;
+        self.wire.stats.bytes_received += datagram.len() as u64;
         if datagram.len() < HEADER_BYTES {
             self.wire.stats.datagrams_dropped += 1;
             return;
         }
-        let kind = datagram[0];
-        let seq = u64::from_le_bytes(datagram[1..HEADER_BYTES].try_into().unwrap());
-        let payload = &datagram[HEADER_BYTES..];
-        self.wire.stats.bytes_received += datagram.len() as u64;
-
-        match kind {
-            KIND_HELLO => self.handle_hello(from),
-            KIND_HELLO_ACK => {
-                if let Some(connection) = self.connections.get_mut(&from) {
-                    connection.last_received = Instant::now();
-                    if !connection.established {
-                        connection.established = true;
-                        let id = connection.id;
-                        self.events
-                            .push((TransportEvent::Connected(id), Vec::new()));
-                    }
-                } else {
-                    self.wire.stats.datagrams_dropped += 1;
-                }
-            }
-            KIND_HEARTBEAT => {
-                if let Some(connection) = self.connections.get_mut(&from) {
-                    connection.last_received = Instant::now();
-                } else {
-                    self.wire.stats.datagrams_dropped += 1;
-                }
-            }
-            KIND_DISCONNECT => {
-                if self.connections.contains_key(&from) {
-                    self.remove_connection(from);
-                }
-            }
-            KIND_ACK => {
-                if let Some(connection) = self.connections.get_mut(&from) {
-                    connection.last_received = Instant::now();
-                    if connection.pending.as_ref().is_some_and(|p| p.0 == seq) {
-                        connection.pending = None;
-                    }
-                } else {
-                    self.wire.stats.datagrams_dropped += 1;
-                }
-            }
-            KIND_PAYLOAD_UNRELIABLE => {
-                if let Some(connection) = self.connections.get_mut(&from) {
-                    connection.last_received = Instant::now();
-                    let id = connection.id;
-                    self.events
-                        .push((TransportEvent::Received(id), payload.to_vec()));
-                } else {
-                    self.wire.stats.datagrams_dropped += 1;
-                }
-            }
-            KIND_PAYLOAD_RELIABLE => {
-                if let Some(connection) = self.connections.get_mut(&from) {
-                    connection.last_received = Instant::now();
-                    let id = connection.id;
-                    let expected = connection.expected_incoming;
-                    if seq == expected {
-                        connection.expected_incoming += 1;
-                        self.wire.send(from, KIND_ACK, seq, &[]);
-                        self.events
-                            .push((TransportEvent::Received(id), payload.to_vec()));
-                    } else if seq < expected {
-                        self.wire.send(from, KIND_ACK, seq, &[]);
-                    } else {
-                        self.wire.stats.datagrams_dropped += 1;
-                    }
-                } else {
-                    self.wire.stats.datagrams_dropped += 1;
-                }
-            }
-            _ => {
+        if !self.connections.contains_key(&from) {
+            if datagram[0] != KIND_CONNECT {
                 self.wire.stats.datagrams_dropped += 1;
+                return;
             }
+            let id = ConnectionId(self.next_id);
+            self.next_id += 1;
+            self.connections.insert(
+                from,
+                Connection {
+                    id,
+                    protocol: Protocol::new(false, Instant::now()),
+                },
+            );
+            self.by_id.insert(id, from);
         }
+        let now = Instant::now();
+        let unique_id = self.unique_id;
+        let mut out = FrameOut::new(self.config.mtu);
+        if let Some(connection) = self.connections.get_mut(&from) {
+            connection
+                .protocol
+                .handle_datagram(now, &self.config, unique_id, datagram, &mut out);
+        }
+        for datagram in out.take() {
+            self.wire.send_datagram(from, &datagram);
+        }
+        self.collect_connection(from);
     }
 
-    fn handle_hello(&mut self, from: SocketAddr) {
+    fn pump_connection(&mut self, addr: SocketAddr) {
         let now = Instant::now();
-        if let Some(connection) = self.connections.get_mut(&from) {
-            connection.last_received = now;
-            self.wire.send(from, KIND_HELLO_ACK, 0, &[]);
-            return;
+        let unique_id = self.unique_id;
+        let mut out = FrameOut::new(self.config.mtu);
+        {
+            let Some(connection) = self.connections.get_mut(&addr) else {
+                return;
+            };
+            connection
+                .protocol
+                .tick(now, &self.config, unique_id, &mut out);
         }
+        for datagram in out.take() {
+            self.wire.send_datagram(addr, &datagram);
+        }
+        self.collect_connection(addr);
+    }
 
-        let id = ConnectionId(self.next_id);
-        self.next_id += 1;
-        self.connections.insert(
-            from,
-            Connection {
-                id,
-                outgoing: 0,
-                reliable_outgoing: 0,
-                expected_incoming: 0,
-                pending: None,
-                outbox: Vec::new(),
-                last_received: now,
-                last_heartbeat: now,
-                established: true,
-                closed: false,
-            },
-        );
-        self.by_id.insert(id, from);
-        self.wire.send(from, KIND_HELLO_ACK, 0, &[]);
-        self.events
-            .push((TransportEvent::Connected(id), Vec::new()));
+    fn collect_connection(&mut self, addr: SocketAddr) {
+        let mut finished: Option<(ConnectionId, String)> = None;
+        let mut incoming: Vec<(TransportEvent, Vec<u8>)> = Vec::new();
+        if let Some(connection) = self.connections.get_mut(&addr) {
+            let id = connection.id;
+            if connection.protocol.take_connected() {
+                incoming.push((TransportEvent::Connected(id), Vec::new()));
+            }
+            for payload in connection.protocol.take_released() {
+                incoming.push((TransportEvent::Received(id), payload));
+            }
+            if connection.protocol.is_dead() {
+                let reason = connection
+                    .protocol
+                    .reason()
+                    .unwrap_or("Connection closed")
+                    .to_owned();
+                finished = Some((id, reason));
+            }
+        }
+        self.events.extend(incoming);
+        if let Some((id, reason)) = finished {
+            self.connections.remove(&addr);
+            self.by_id.remove(&id);
+            self.reasons.insert(id, reason);
+            self.events
+                .push((TransportEvent::Disconnected(id), Vec::new()));
+        }
     }
 }
 
-enum PumpAction {
-    Idle,
-    Send(u64, Vec<u8>),
-    Resend(u64, Vec<u8>),
+fn unique_identifier() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x5eed_0000_0000_0001);
+    let pid = u64::from(std::process::id());
+    (nanos ^ (pid << 32) ^ 0x9e37_79b9_7f4a_7c15) | 1
 }

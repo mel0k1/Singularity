@@ -54,8 +54,7 @@ The FFI contract: C# builds the registries — component types, network ids, ser
 | `rust/crates/singularity-crypto` | Rust | XChaCha20-Poly1305 frame codec, wire-compatible with `NetEncryption` |
 | `rust/crates/singularity-physics` | Rust | physics backend study: Rapier and Avian behind a shared `PhysicsBackend` seam, benchmarked and parity-checked — see [docs/physics-bench.md](docs/physics-bench.md) |
 | `rust/crates/singularity-physics-ffi` | Rust | the C ABI seam: per-map `SgWorld`, command-buffer apply, bulk state/event copy — the native side of `IPhysicsBackend` |
-| `rust/crates/singularity-net-transport` · planned | Rust | Lidgren-compatible transport study |
-| `rust/crates/singularity-net-transport` | Rust | the transport seam below `INetChannel`: UDP transport, handshake, stop-and-wait reliability, event polling, C ABI — see [docs/net-transport.md](docs/net-transport.md) |
+| `rust/crates/singularity-net-transport` | Rust | the transport seam below `INetChannel`: speaks the engine fork's Lidgren wire format byte for byte — handshake, SRN windows, fragmentation, ping/RTT, frame-boundary crypto — see [docs/net-transport.md](docs/net-transport.md) |
 | `rust/crates/singularity-pvs` · planned | Rust | SoA per-session visibility data |
 | `csharp/engine` | C# | vendored RobustToolbox @ fdb576c — the starting point of the orchestration core; carries the `IPhysicsBackend` seam behind `SharedPhysicsSystem.SimulateWorld()` |
 | `csharp/benches/Singularity.PhysicsBench` | C# | farseer and the rapier mirror measured in-situ on the real ECS — see [docs/physics-bench.md](docs/physics-bench.md) |
@@ -68,7 +67,7 @@ Research phase complete. The Robust Toolbox sources were studied subsystem by su
 
 1. `singularity-crypto` — done
 2. `singularity-physics` — done and in: `IPhysicsBackend` behind `SimulateWorld()`, rapier mirror measured in-situ (docs/physics-bench.md) — joints, pair filter, incremental collection and sleep tuning landed; prediction parity via the shared binary remains
-3. `singularity-net-transport` — seam spike done (docs/net-transport.md): UDP transport, event model, FFI and stop-and-wait reliability under measured loss; the C# seam is in too — `INetChannel` over `sg_transport_*` behind `net.backend` (default `lidgren`), proven by a loopback pair test in CI; the Lidgren framer port is the next milestone
+3. `singularity-net-transport` — framer done (docs/net-transport.md): the crate now speaks the vendored fork's Lidgren wire format byte for byte — 5-byte headers, selective-repeat windows, fragmentation, ping/RTT, ack packing — with `singularity-crypto` on the frame boundary; a wire-compat test drives a Rust endpoint against a real C# `NetServer` (encrypted payloads, 8 KB fragments, RTT, disconnect reasons) and runs in CI next to the loopback pair test; the C# seam is `INetChannel` over `sg_transport_*` behind `net.backend` (default `lidgren`); NetManager wiring is the next milestone
 4. `singularity-pvs` — SoA session data; the pinned `PvsData` structs are already unmanaged
 5. C# core onboarding — done: engine vendored (`csharp/engine`), Farseer measured in-situ (`csharp/benches`), determinism confirmed
 

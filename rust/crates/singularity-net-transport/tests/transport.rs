@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use singularity_net_transport::ffi::*;
 use singularity_net_transport::{
-    ConnectionId, Delivery, MAX_DATAGRAM, TransportEvent, UdpTransport,
+    ConnectionId, Delivery, MAX_GROUP_BYTES, MAX_UNRELIABLE_BYTES, TransportEvent, UdpTransport,
 };
 
 struct Pair {
@@ -155,24 +155,67 @@ fn reliable_ordered_survives_packet_loss() {
 }
 
 #[test]
-fn close_notifies_peer() {
+fn fragmented_reliable_roundtrip() {
     let mut pair = Pair::new();
     pair.connect();
     assert!(pair.established());
     let conn = pair.client_conn.unwrap();
-    pair.client.close(conn);
 
-    let mut disconnected = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !disconnected && Instant::now() < deadline {
+    let mut payload = vec![0u8; 16 * 1024];
+    for (i, byte) in payload.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    assert!(pair.client.send(conn, Delivery::ReliableOrdered, &payload));
+
+    let mut received: Option<Vec<u8>> = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while received.is_none() && Instant::now() < deadline {
         pair.step();
-        disconnected = pair
-            .server_events
-            .drain(..)
-            .any(|(event, _)| matches!(event, TransportEvent::Disconnected(_)));
+        for (event, data) in pair.server_events.drain(..) {
+            if let TransportEvent::Received(_) = event
+                && data.len() == payload.len()
+            {
+                received = Some(data);
+            }
+        }
     }
 
-    assert!(disconnected, "server never saw disconnect");
+    assert_eq!(
+        received.as_ref(),
+        Some(&payload),
+        "fragmented payload broken"
+    );
+    assert!(
+        pair.client.stats().datagrams_sent > 20,
+        "expected many fragment datagrams"
+    );
+}
+
+#[test]
+fn close_notifies_peer_and_carries_reason() {
+    let mut pair = Pair::new();
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+    pair.client.disconnect(conn, "local bye");
+
+    let mut disconnected = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while disconnected.is_none() && Instant::now() < deadline {
+        pair.step();
+        for (event, _) in pair.server_events.drain(..) {
+            if let TransportEvent::Disconnected(id) = event {
+                disconnected = Some(id);
+            }
+        }
+    }
+
+    let id = disconnected.expect("server never saw disconnect");
+    assert_eq!(
+        pair.server.disconnect_reason(id),
+        Some("local bye"),
+        "reason did not cross the wire"
+    );
     assert_eq!(pair.server.stats().connections, 0);
 }
 
@@ -192,18 +235,23 @@ fn silence_times_out() {
     pair.connect();
     assert!(pair.established());
 
-    let mut timed_out = false;
+    let mut timed_out = None;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !timed_out && Instant::now() < deadline {
+    while timed_out.is_none() && Instant::now() < deadline {
         pair.server.poll(&mut pair.server_events);
-        timed_out = pair
-            .server_events
-            .drain(..)
-            .any(|(event, _)| matches!(event, TransportEvent::Disconnected(_)));
+        for (event, _) in pair.server_events.drain(..) {
+            if let TransportEvent::Disconnected(id) = event {
+                timed_out = Some(id);
+            }
+        }
         sleep(Duration::from_millis(5));
     }
 
-    assert!(timed_out, "timeout never fired");
+    let id = timed_out.expect("timeout never fired");
+    assert_eq!(
+        pair.server.disconnect_reason(id),
+        Some("Connection timed out")
+    );
 }
 
 #[test]
@@ -212,25 +260,70 @@ fn payload_bounds() {
     pair.connect();
     let conn = pair.client_conn.unwrap();
 
-    let oversized = vec![7u8; MAX_DATAGRAM + 1];
+    let oversized = vec![7u8; MAX_UNRELIABLE_BYTES + 1];
     assert!(!pair.client.send(conn, Delivery::Unreliable, &oversized));
 
-    let exact = vec![7u8; MAX_DATAGRAM];
+    let exact = vec![7u8; MAX_UNRELIABLE_BYTES];
     assert!(pair.client.send(conn, Delivery::Unreliable, &exact));
 
+    let beyond_group = vec![7u8; MAX_GROUP_BYTES + 1];
+    assert!(
+        !pair
+            .client
+            .send(conn, Delivery::ReliableOrdered, &beyond_group)
+    );
+
+    let fragmented = vec![9u8; 1200];
+    assert!(
+        pair.client
+            .send(conn, Delivery::ReliableOrdered, &fragmented)
+    );
+
     let mut delivered = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while delivered == 0 && Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while delivered < 2 && Instant::now() < deadline {
         pair.step();
-        delivered = pair
+        delivered += pair
             .server_events
             .drain(..)
             .filter(|(event, payload)| {
-                matches!(event, TransportEvent::Received(_)) && payload.len() == MAX_DATAGRAM
+                matches!(event, TransportEvent::Received(_))
+                    && (payload.len() == MAX_UNRELIABLE_BYTES || payload.len() == 1200)
             })
             .count();
     }
-    assert_eq!(delivered, 1, "mtu-sized payload missing");
+    assert_eq!(delivered, 2, "boundary payloads missing");
+}
+
+#[test]
+fn rtt_measured_after_pings() {
+    let mut pair = Pair::new();
+    pair.server.set_timings(
+        Duration::from_millis(20),
+        Duration::from_millis(2000),
+        Duration::from_millis(0),
+    );
+    pair.client.set_timings(
+        Duration::from_millis(20),
+        Duration::from_millis(2000),
+        Duration::from_millis(0),
+    );
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+
+    let server_conn = pair.server_conn.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (pair.client.rtt(conn) < 0.0 || pair.server.rtt(server_conn) < 0.0)
+        && Instant::now() < deadline
+    {
+        pair.step();
+    }
+    assert!(pair.client.rtt(conn) >= 0.0, "no pong came back");
+    assert!(
+        pair.server.rtt(server_conn) >= 0.0,
+        "server rtt stayed unknown"
+    );
 }
 
 #[test]
@@ -308,14 +401,16 @@ fn ffi_surface_end_to_end() {
 
         let client = sg_transport_bind(c"127.0.0.1:0".as_ptr().cast());
         assert!(!client.is_null());
+        assert_eq!(sg_transport_set_timings(client, 20, 2000, 30), 1);
+        assert_eq!(sg_transport_set_timings(server, 20, 2000, 30), 1);
         let conn = sg_transport_connect(client, server_addr.as_ptr().cast());
         assert_ne!(conn, 0);
 
         let mut events: Vec<SgNetEvent> = (0..16).map(|_| SgNetEvent::default()).collect();
         let mut client_connected = false;
-        let mut server_connected = false;
+        let mut server_connected = 0u64;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (!client_connected || !server_connected) && Instant::now() < deadline {
+        while (server_connected == 0 || !client_connected) && Instant::now() < deadline {
             let n = sg_transport_poll(client, events.as_mut_ptr(), events.len());
             for event in &events[..n] {
                 if event.kind == EVENT_CONNECTED {
@@ -325,12 +420,12 @@ fn ffi_surface_end_to_end() {
             let n = sg_transport_poll(server, events.as_mut_ptr(), events.len());
             for event in &events[..n] {
                 if event.kind == EVENT_CONNECTED {
-                    server_connected = true;
+                    server_connected = event.connection;
                 }
             }
             sleep(Duration::from_millis(1));
         }
-        assert!(client_connected && server_connected);
+        assert!(client_connected && server_connected != 0);
 
         let client_port = sg_transport_local_port(client);
         let mut endpoint = [0i8; 64];
@@ -342,14 +437,25 @@ fn ffi_surface_end_to_end() {
         let text: String = endpoint[..end].iter().map(|&c| c as u8 as char).collect();
         assert_eq!(text, format!("127.0.0.1:{client_port}"));
 
+        let key: [u8; 32] = core::array::from_fn(|i| (i * 7 + 1) as u8);
         assert_eq!(
-            sg_transport_send(client, conn, DELIVERY_UNRELIABLE, b"hello ffi".as_ptr(), 9),
+            sg_transport_set_key(client, conn, key.as_ptr(), key.len()),
+            1
+        );
+        assert_eq!(
+            sg_transport_set_key(server, server_connected, key.as_ptr(), key.len()),
+            1
+        );
+
+        assert_eq!(
+            sg_transport_send(client, conn, 67, b"hello ffi".as_ptr(), 9),
             1
         );
 
         let mut got = 0usize;
         let deadline = Instant::now() + Duration::from_secs(5);
         while got == 0 && Instant::now() < deadline {
+            sg_transport_poll(client, events.as_mut_ptr(), events.len());
             let n = sg_transport_poll(server, events.as_mut_ptr(), events.len());
             for event in &events[..n] {
                 if event.kind == EVENT_RECEIVED && event.length == 9 {
@@ -359,14 +465,85 @@ fn ffi_surface_end_to_end() {
             }
             sleep(Duration::from_millis(1));
         }
-        assert_eq!(got, 1);
+        assert_eq!(got, 1, "encrypted ffi payload never arrived");
+
+        let big: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        assert_eq!(
+            sg_transport_send(server, server_connected, 67, big.as_ptr(), big.len()),
+            1
+        );
+
+        let mut overflow = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while overflow.is_none() && Instant::now() < deadline {
+            sg_transport_poll(server, events.as_mut_ptr(), events.len());
+            let n = sg_transport_poll(client, events.as_mut_ptr(), events.len());
+            for event in &events[..n] {
+                if event.kind == EVENT_RECEIVED && event.length as usize == big.len() {
+                    assert_eq!(event.reserved, EVENT_OVERFLOW);
+                    overflow = Some(event.length as usize);
+                }
+            }
+            sleep(Duration::from_millis(1));
+        }
+        let needed = overflow.expect("fragmented overflow event missing");
+        let mut small = [0u8; 16];
+        assert_eq!(
+            sg_transport_fetch(client, small.as_mut_ptr(), small.len()),
+            needed
+        );
+        let mut fetched = vec![0u8; needed];
+        assert_eq!(
+            sg_transport_fetch(client, fetched.as_mut_ptr(), fetched.len()),
+            needed
+        );
+        assert_eq!(fetched, big, "overflow fetch payload mismatch");
+
+        let mut rtt_seen = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rtt_seen && Instant::now() < deadline {
+            sg_transport_poll(client, events.as_mut_ptr(), events.len());
+            rtt_seen = sg_transport_rtt(client, conn) >= 0.0;
+            sleep(Duration::from_millis(2));
+        }
+        assert!(rtt_seen, "no rtt through the ffi");
+        assert!(sg_transport_time_offset(client, conn).is_finite());
 
         let mut stats = SgNetStats::default();
         assert_eq!(sg_transport_stats(server, &mut stats), 1);
         assert!(stats.datagrams_received > 0);
         assert_eq!(stats.connections, 1);
 
-        sg_transport_close(client, conn);
+        let reason = c"ffi bye";
+        sg_transport_disconnect(client, conn, reason.as_ptr().cast(), 1);
+
+        let mut saw_disconnect = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !saw_disconnect && Instant::now() < deadline {
+            let n = sg_transport_poll(server, events.as_mut_ptr(), events.len());
+            for event in &events[..n] {
+                if event.kind == EVENT_DISCONNECTED {
+                    saw_disconnect = true;
+                }
+            }
+            sleep(Duration::from_millis(1));
+        }
+        assert!(saw_disconnect, "server never saw the ffi disconnect");
+
+        let mut reason_buf = [0i8; 64];
+        assert_eq!(
+            sg_transport_disconnect_reason(
+                server,
+                server_connected,
+                reason_buf.as_mut_ptr(),
+                reason_buf.len()
+            ),
+            1
+        );
+        let end = reason_buf.iter().position(|&c| c == 0).unwrap();
+        let text: String = reason_buf[..end].iter().map(|&c| c as u8 as char).collect();
+        assert_eq!(text, "ffi bye");
+
         sg_transport_destroy(client);
         sg_transport_destroy(server);
     }

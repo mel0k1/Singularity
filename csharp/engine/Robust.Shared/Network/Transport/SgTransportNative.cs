@@ -8,16 +8,16 @@ namespace Robust.Shared.Network.Transport;
 
 internal static class SgTransportNative
 {
-    public const uint AbiVersion = 1;
+    public const uint AbiVersion = 2;
 
     public const uint EventConnected = 0;
     public const uint EventDisconnected = 1;
     public const uint EventReceived = 2;
 
-    public const uint DeliveryUnreliable = 0;
-    public const uint DeliveryReliableOrdered = 1;
+    public const uint PayloadInline = 0;
+    public const uint PayloadOverflow = 1;
 
-    public const int MaxDatagram = 1200;
+    public const int MaxEventPayload = 1200;
 
     private const string Library = "singularity_net_transport";
 
@@ -30,7 +30,7 @@ internal static class SgTransportNative
         public ulong Connection;
         public uint Length;
         public uint Reserved;
-        public fixed byte Data[MaxDatagram];
+        public fixed byte Data[MaxEventPayload];
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -127,7 +127,27 @@ internal static class SgTransportNative
         nuint capacity);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static unsafe extern nuint sg_transport_fetch(
+        IntPtr transport,
+        byte* buffer,
+        nuint capacity);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void sg_transport_close(IntPtr transport, ulong connection);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void sg_transport_disconnect(
+        IntPtr transport,
+        ulong connection,
+        [MarshalAs(UnmanagedType.LPStr)] string reason,
+        uint sendBye);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static unsafe extern uint sg_transport_disconnect_reason(
+        IntPtr transport,
+        ulong connection,
+        byte* buffer,
+        nuint capacity);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static extern uint sg_transport_remote_endpoint(
@@ -135,6 +155,37 @@ internal static class SgTransportNative
         ulong connection,
         [Out] byte[] endpoint,
         nuint capacity);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_set_app_identifier(
+        IntPtr transport,
+        [MarshalAs(UnmanagedType.LPStr)] string appIdentifier);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_set_mtu(IntPtr transport, uint mtu);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_mtu(IntPtr transport);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_set_timings(
+        IntPtr transport,
+        uint pingIntervalMs,
+        uint timeoutMs,
+        uint resendDelayMs);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static unsafe extern uint sg_transport_set_key(
+        IntPtr transport,
+        ulong connection,
+        byte* key,
+        nuint length);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern float sg_transport_rtt(IntPtr transport, ulong connection);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern float sg_transport_time_offset(IntPtr transport, ulong connection);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static unsafe extern uint sg_transport_stats(

@@ -3401,6 +3401,9 @@ dependencies = [
 [[package]]
 name = "singularity-net-transport"
 version = "0.1.0"
+dependencies = [
+ "singularity-crypto",
+]
 
 [[package]]
 name = "singularity-physics"

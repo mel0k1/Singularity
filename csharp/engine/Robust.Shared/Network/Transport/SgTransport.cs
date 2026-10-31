@@ -17,6 +17,7 @@ public sealed class SgTransport : IDisposable
     private readonly IRobustSerializer _serializer;
     private readonly Dictionary<ulong, SgTransportChannel> _channels = new();
     private readonly SgTransportNative.SgNetEvent[] _events = new SgTransportNative.SgNetEvent[PollCapacity];
+    private readonly byte[] _scratch = new byte[4096];
     private IntPtr _handle;
 
     private SgTransport(ISgTransportHost host, IRobustSerializer serializer, IntPtr handle)
@@ -51,11 +52,76 @@ public sealed class SgTransport : IDisposable
 
     public ushort LocalPort => _handle == IntPtr.Zero ? (ushort) 0 : SgTransportNative.sg_transport_local_port(_handle);
 
+    public int Mtu => _handle == IntPtr.Zero ? 0 : checked((int) SgTransportNative.sg_transport_mtu(_handle));
+
     public IReadOnlyCollection<SgTransportChannel> Channels => _channels.Values;
 
     internal ISgTransportHost Host => _host;
 
     internal IRobustSerializer Serializer => _serializer;
+
+    public void SetAppIdentifier(string appIdentifier)
+    {
+        SgTransportNative.sg_transport_set_app_identifier(_handle, appIdentifier);
+    }
+
+    public void SetMtu(int mtu)
+    {
+        SgTransportNative.sg_transport_set_mtu(_handle, checked((uint) mtu));
+    }
+
+    public void SetTimings(TimeSpan pingInterval, TimeSpan timeout, TimeSpan resendDelay)
+    {
+        SgTransportNative.sg_transport_set_timings(
+            _handle,
+            Math.Max(1, (uint) pingInterval.TotalMilliseconds),
+            Math.Max(1, (uint) timeout.TotalMilliseconds),
+            (uint) resendDelay.TotalMilliseconds);
+    }
+
+    public bool SetEncryptionKey(ulong connection, byte[] key)
+    {
+        if (key.Length != 32)
+            throw new ArgumentException("transport keys must be 32 bytes");
+
+        unsafe
+        {
+            fixed (byte* material = key)
+            {
+                return SgTransportNative.sg_transport_set_key(_handle, connection, material, (nuint) key.Length) != 0;
+            }
+        }
+    }
+
+    public float Rtt(ulong connection)
+    {
+        return SgTransportNative.sg_transport_rtt(_handle, connection);
+    }
+
+    public float RemoteTimeOffsetSeconds(ulong connection)
+    {
+        return SgTransportNative.sg_transport_time_offset(_handle, connection);
+    }
+
+    public string? DisconnectReason(ulong connection)
+    {
+        unsafe
+        {
+            fixed (byte* buffer = _scratch)
+            {
+                var written = SgTransportNative.sg_transport_disconnect_reason(
+                    _handle, connection, buffer, (nuint) _scratch.Length);
+                if (written == 0)
+                    return null;
+
+                var end = 0;
+                while (end < _scratch.Length && _scratch[end] != 0)
+                    end++;
+
+                return Encoding.UTF8.GetString(_scratch, 0, end);
+            }
+        }
+    }
 
     public void Pump()
     {
@@ -128,8 +194,9 @@ public sealed class SgTransport : IDisposable
         if (!_channels.Remove(connection, out var channel))
             return;
 
+        var reason = DisconnectReason(connection) ?? "connection closed";
         channel.MarkDisconnected();
-        _host.Disconnected(channel, "connection closed");
+        _host.Disconnected(channel, reason);
     }
 
     private unsafe void OnReceived(ulong connection, SgTransportNative.SgNetEvent source)
@@ -138,15 +205,34 @@ public sealed class SgTransport : IDisposable
             return;
 
         var length = (int) source.Length;
-        if (length < 0 || length > SgTransportNative.MaxDatagram)
+        if (length <= 0)
             return;
 
-        var payload = new Span<byte>(source.Data, length).ToArray();
+        byte[] payload;
+        if (source.Reserved == SgTransportNative.PayloadOverflow || length > SgTransportNative.MaxEventPayload)
+        {
+            payload = FetchOverflow(length);
+        }
+        else
+        {
+            payload = new Span<byte>(source.Data, length).ToArray();
+        }
+
         var message = new NetIncomingMessage();
         message.Data = payload;
         message.LengthBytes = length;
         message.Position = 0;
         _host.Received(channel, message);
+    }
+
+    private unsafe byte[] FetchOverflow(int length)
+    {
+        var buffer = new byte[length];
+        fixed (byte* dst = buffer)
+        {
+            var fetched = (int) SgTransportNative.sg_transport_fetch(_handle, dst, (nuint) buffer.Length);
+            return fetched == length ? buffer : Array.Empty<byte>();
+        }
     }
 
     private IPEndPoint? QueryRemoteEndPoint(ulong connection)
@@ -176,11 +262,11 @@ public sealed class SgTransport : IDisposable
         }
     }
 
-    internal void CloseChannel(ulong connection)
+    internal void CloseChannel(ulong connection, string reason, bool sendBye = true)
     {
         if (_handle == IntPtr.Zero)
             return;
 
-        SgTransportNative.sg_transport_close(_handle, connection);
+        SgTransportNative.sg_transport_disconnect(_handle, connection, reason, sendBye ? 1u : 0u);
     }
 }

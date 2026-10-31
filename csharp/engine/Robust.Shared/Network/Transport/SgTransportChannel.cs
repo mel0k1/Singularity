@@ -35,17 +35,24 @@ public sealed class SgTransportChannel : INetChannel
 
     public LoginType AuthType { get; set; }
 
-    public TimeSpan RemoteTimeOffset => TimeSpan.Zero;
+    public TimeSpan RemoteTimeOffset => TimeSpan.FromSeconds(_transport.RemoteTimeOffsetSeconds(_connection));
 
-    public TimeSpan RemoteTime => TimeSpan.Zero;
+    public TimeSpan RemoteTime => TimeSpan.FromSeconds(_transport.RemoteTimeOffsetSeconds(_connection));
 
-    public short Ping => 0;
+    public short Ping
+    {
+        get
+        {
+            var rtt = _transport.Rtt(_connection);
+            return rtt < 0 ? (short) 0 : (short) Math.Round(rtt * 1000);
+        }
+    }
 
     public bool IsConnected => _established && !_closed;
 
     public bool IsHandshakeComplete { get; set; }
 
-    public int CurrentMtu => SgTransportNative.MaxDatagram;
+    public int CurrentMtu => _transport.Mtu;
 
     internal void MarkEstablished()
     {
@@ -84,7 +91,7 @@ public sealed class SgTransportChannel : INetChannel
         message.WriteToBuffer(packet, _transport.Serializer);
         _encryption?.Encrypt(packet);
 
-        if (!_transport.Send(_connection, MapDelivery(message.DeliveryMethod), packet.Data.AsSpan(0, packet.LengthBytes)))
+        if (!_transport.Send(_connection, MapDelivery(message), packet.Data.AsSpan(0, packet.LengthBytes)))
             throw new NetManagerException($"sg_transport rejected a {packet.LengthBytes} byte payload");
     }
 
@@ -95,8 +102,16 @@ public sealed class SgTransportChannel : INetChannel
 
     public void Disconnect(string reason, bool sendBye)
     {
-        if (IsConnected)
-            _transport.CloseChannel(_connection);
+        if (!IsConnected)
+            return;
+
+        if (sendBye)
+        {
+            _transport.CloseChannel(_connection, reason);
+            return;
+        }
+
+        _transport.CloseChannel(_connection, string.Empty);
     }
 
     public bool CanSendImmediately(NetDeliveryMethod method, int sequenceChannel)
@@ -109,14 +124,8 @@ public sealed class SgTransportChannel : INetChannel
         return $"{ConnectionId}/{UserId}";
     }
 
-    private static uint MapDelivery(NetDeliveryMethod method)
+    private static uint MapDelivery(NetMessage message)
     {
-        return method switch
-        {
-            NetDeliveryMethod.ReliableUnordered
-                or NetDeliveryMethod.ReliableSequenced
-                or NetDeliveryMethod.ReliableOrdered => SgTransportNative.DeliveryReliableOrdered,
-            _ => SgTransportNative.DeliveryUnreliable,
-        };
+        return (uint) message.DeliveryMethod + (uint) message.SequenceChannel;
     }
 }

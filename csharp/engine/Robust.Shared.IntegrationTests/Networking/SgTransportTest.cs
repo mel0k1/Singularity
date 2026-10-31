@@ -69,6 +69,8 @@ internal sealed class SgTransportTest : RobustIntegrationTest
 
         Assert.That(PumpUntil(() => clientHost.Channel != null && serverHost.Channel != null, serverTransport, clientTransport), Is.True);
 
+        serverTransport.SetTimings(TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(50));
+
         var watch = Stopwatch.StartNew();
         while (watch.Elapsed < TimeSpan.FromSeconds(5) && serverHost.Disconnections == 0)
         {
