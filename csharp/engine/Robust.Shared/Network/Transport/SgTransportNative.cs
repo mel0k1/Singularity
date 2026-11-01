@@ -8,7 +8,7 @@ namespace Robust.Shared.Network.Transport;
 
 internal static class SgTransportNative
 {
-    public const uint AbiVersion = 4;
+    public const uint AbiVersion = 5;
 
     public const uint EventConnected = 0;
     public const uint EventDisconnected = 1;
@@ -186,6 +186,11 @@ internal static class SgTransportNative
         uint pingIntervalMs,
         uint timeoutMs,
         uint resendDelayMs);
+
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern uint sg_transport_set_pacing(
+        IntPtr transport,
+        uint windowMs);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     internal static unsafe extern uint sg_transport_set_key(

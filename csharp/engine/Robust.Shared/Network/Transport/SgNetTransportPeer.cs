@@ -116,6 +116,9 @@ internal sealed class SgNetTransportPeer : INetTransportPeer
         var pingMs = Math.Max(1, (uint) TimeSpan.FromSeconds(settings.PingInterval).TotalMilliseconds);
         var timeoutMs = Math.Max(1, (uint) TimeSpan.FromSeconds(settings.ConnectionTimeout).TotalMilliseconds);
         SgTransportNative.sg_transport_set_timings(_handle, pingMs, timeoutMs, 0);
+        SgTransportNative.sg_transport_set_pacing(
+            _handle,
+            (uint) Math.Max(0, settings.PacingMilliseconds));
     }
 
     public unsafe void Pump(List<NetTransportEvent> events)

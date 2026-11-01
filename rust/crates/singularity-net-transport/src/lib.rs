@@ -16,13 +16,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use protocol::MIN_MTU;
 use wire::{HEADER_BYTES, KIND_CONNECT};
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 pub const MAX_EVENT_INLINE: usize = 1200;
 pub const MAX_UNRELIABLE_BYTES: usize = 8191;
 
 const POLL_BURST: usize = 256;
 const RECV_BUFFER: usize = 65536;
+const POLL_EMA_RESET: Duration = Duration::from_secs(10);
+const POLL_EMA_ALPHA: f64 = 0.3;
+
+fn blend_poll_interval(ema: Option<Duration>, interval: Duration) -> Option<Duration> {
+    let previous = ema.unwrap_or(Duration::ZERO);
+    Some(previous.mul_f64(1.0 - POLL_EMA_ALPHA) + interval.mul_f64(POLL_EMA_ALPHA))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Delivery {
@@ -98,6 +105,8 @@ impl Wire {
 struct Connection {
     id: ConnectionId,
     protocol: Protocol,
+    tail: Vec<u8>,
+    tail_deadline: Instant,
 }
 
 pub struct UdpTransport {
@@ -111,6 +120,8 @@ pub struct UdpTransport {
     config: TransportConfig,
     unique_id: u64,
     recv_buffer: Vec<u8>,
+    last_poll: Option<Instant>,
+    poll_ema: Option<Duration>,
 }
 
 impl UdpTransport {
@@ -133,6 +144,8 @@ impl UdpTransport {
             config: TransportConfig::default(),
             unique_id: unique_identifier(),
             recv_buffer: vec![0u8; RECV_BUFFER],
+            last_poll: None,
+            poll_ema: None,
         })
     }
 
@@ -187,6 +200,14 @@ impl UdpTransport {
         self.config.expand_mtu_fail_attempts = fail_attempts.max(1);
     }
 
+    pub fn set_pacing(&mut self, window: Duration) {
+        self.config.pacing = if window.is_zero() {
+            Duration::ZERO
+        } else {
+            window.max(Duration::from_millis(1))
+        };
+    }
+
     pub fn connection_mtu(&self, conn: ConnectionId) -> usize {
         let Some(addr) = self.by_id.get(&conn) else {
             return self.config.mtu;
@@ -213,6 +234,8 @@ impl UdpTransport {
             Connection {
                 id,
                 protocol: Protocol::new(true, Instant::now()),
+                tail: Vec::new(),
+                tail_deadline: Instant::now(),
             },
         );
         self.by_id.insert(id, addr);
@@ -259,6 +282,12 @@ impl UdpTransport {
         let Some(addr) = self.by_id.get(&conn).copied() else {
             return;
         };
+        if let Some(connection) = self.connections.get_mut(&addr)
+            && !connection.tail.is_empty()
+        {
+            let tail = std::mem::take(&mut connection.tail);
+            self.wire.send_datagram(addr, &tail);
+        }
         let mut out = FrameOut::new(self.config.mtu);
         if let Some(connection) = self.connections.get_mut(&addr) {
             connection.protocol.disconnect(reason, send_bye, &mut out);
@@ -305,6 +334,16 @@ impl UdpTransport {
 
     pub fn poll(&mut self, out: &mut Vec<(TransportEvent, Vec<u8>)>) {
         out.clear();
+        let poll_now = Instant::now();
+        if let Some(last) = self.last_poll {
+            let interval = poll_now.saturating_duration_since(last);
+            if interval >= POLL_EMA_RESET {
+                self.poll_ema = None;
+            } else {
+                self.poll_ema = blend_poll_interval(self.poll_ema, interval);
+            }
+        }
+        self.last_poll = Some(poll_now);
         loop {
             let mut drained = 0;
             for _ in 0..POLL_BURST {
@@ -378,6 +417,8 @@ impl UdpTransport {
                 Connection {
                     id,
                     protocol: Protocol::new(false, Instant::now()),
+                    tail: Vec::new(),
+                    tail_deadline: Instant::now(),
                 },
             );
             self.by_id.insert(id, from);
@@ -401,16 +442,44 @@ impl UdpTransport {
     fn pump_connection(&mut self, addr: SocketAddr) {
         let now = Instant::now();
         let unique_id = self.unique_id;
+        let window = self.config.pacing;
+        let engaged =
+            window > Duration::ZERO && self.poll_ema.is_some_and(|ema| window >= ema + ema);
+        let mut released_tail: Option<Vec<u8>> = None;
         let datagrams = {
             let Some(connection) = self.connections.get_mut(&addr) else {
                 return;
             };
-            let mut out = FrameOut::new(connection.protocol.current_mtu(&self.config));
+            let mtu = connection.protocol.current_mtu(&self.config);
+            let mut out = FrameOut::new(mtu);
+            let mut adopted = false;
+            if !connection.tail.is_empty() {
+                let expired = now >= connection.tail_deadline;
+                if expired || !engaged || connection.tail.len() >= mtu {
+                    released_tail = Some(std::mem::take(&mut connection.tail));
+                } else {
+                    out.adopt(std::mem::take(&mut connection.tail));
+                    adopted = true;
+                }
+            }
             connection
                 .protocol
                 .tick(now, &self.config, unique_id, &mut out);
-            out.take()
+            let mut datagrams = out.take();
+            let holdable = engaged
+                && connection.protocol.status() == Status::Connected
+                && !out.standalone_tail();
+            if holdable && let Some(tail) = datagrams.pop_if(|last| last.len() < mtu) {
+                if !adopted {
+                    connection.tail_deadline = now + window;
+                }
+                connection.tail = tail;
+            }
+            datagrams
         };
+        if let Some(tail) = released_tail {
+            self.wire.send_datagram(addr, &tail);
+        }
         for datagram in datagrams {
             self.wire.send_datagram(addr, &datagram);
         }

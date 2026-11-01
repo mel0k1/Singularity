@@ -156,6 +156,19 @@ namespace Robust.Shared
             CVarDef.Create("net.mtu_expand_fail_attempts", 5, CVar.ARCHIVE);
 
         /// <summary>
+        /// How long the singularity backend may hold back a not-yet-full outgoing datagram hoping to
+        /// pack more frames into it, in milliseconds. 0 disables the hold. The default 2 ms measured
+        /// best on real content: 12x fewer datagrams than the per-pump flush at the same throughput
+        /// (the engine ack-gates its game state sends, so larger windows trade straight into state
+        /// latency - 10 ms fails the throughput gate). The hold only engages while the engine pumps
+        /// at least twice per window, so standard tick rates stay untouched; Lidgren batches on its
+        /// own network thread heartbeat and ignores this cvar.
+        /// </summary>
+        /// <seealso cref="NetMtu"/>
+        public static readonly CVarDef<int> NetPacing =
+            CVarDef.Create("net.pacing", 2, CVar.ARCHIVE);
+
+        /// <summary>
         /// Maximum bytes used by incomplete Lidgren fragment groups for one connection.
         /// </summary>
         public static readonly CVarDef<int> NetMaxFragmentReassemblyBytesPerConnection =

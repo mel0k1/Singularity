@@ -713,3 +713,173 @@ fn expanded_mtu_shrinks_fragment_datagram_count() {
         "expected few fragment datagrams at expanded mtu, got {delta}"
     );
 }
+
+fn wait_until(target: Instant) {
+    while Instant::now() < target {
+        sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn pacing_holds_a_partial_datagram_until_its_deadline() {
+    let mut pair = Pair::new();
+    pair.client.set_pacing(Duration::from_millis(80));
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+
+    pair.client.send(conn, Delivery::Unreliable, b"held");
+    let started = Instant::now();
+    let mut received_at: Option<Duration> = None;
+    let deadline = started + Duration::from_millis(500);
+    while Instant::now() < deadline && received_at.is_none() {
+        pair.step();
+        sleep(Duration::from_millis(5));
+        for (event, payload) in pair.server_events.drain(..) {
+            if let TransportEvent::Received(_) = event {
+                assert_eq!(payload.as_slice(), b"held".as_slice());
+                received_at = Some(started.elapsed());
+            }
+        }
+    }
+
+    let elapsed = received_at.expect("held message never released");
+    assert!(
+        elapsed >= Duration::from_millis(60),
+        "message left after {elapsed:?}, pacing did not hold it"
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "message left after {elapsed:?}, the deadline was re-anchored or ignored"
+    );
+}
+
+#[test]
+fn pacing_packs_frames_from_consecutive_polls_into_one_datagram() {
+    let mut pair = Pair::new();
+    pair.client.set_pacing(Duration::from_millis(150));
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+    let before = pair.client.stats().datagrams_sent;
+
+    let started = Instant::now();
+    pair.client.send(conn, Delivery::Unreliable, b"one");
+    pair.step();
+    wait_until(started + Duration::from_millis(15));
+    pair.client.send(conn, Delivery::Unreliable, b"two");
+    pair.step();
+    wait_until(started + Duration::from_millis(30));
+    pair.client.send(conn, Delivery::Unreliable, b"three");
+    pair.step();
+
+    wait_until(started + Duration::from_millis(70));
+    pair.step();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for (event, payload) in pair.server_events.drain(..) {
+        if let TransportEvent::Received(_) = event {
+            seen.push(payload);
+        }
+    }
+    assert!(seen.is_empty(), "frames left before the deadline: {seen:?}");
+
+    wait_until(started + Duration::from_millis(160));
+    let deadline = started + Duration::from_millis(450);
+    while seen.len() < 3 && Instant::now() < deadline {
+        pair.step();
+        for (event, payload) in pair.server_events.drain(..) {
+            if let TransportEvent::Received(_) = event {
+                seen.push(payload);
+            }
+        }
+    }
+
+    assert_eq!(seen.len(), 3, "held frames lost: {seen:?}");
+    assert!(seen.iter().any(|p| p == b"one"));
+    assert!(seen.iter().any(|p| p == b"two"));
+    assert!(seen.iter().any(|p| p == b"three"));
+    let delta = pair.client.stats().datagrams_sent - before;
+    assert_eq!(delta, 1, "three polls should have left as one datagram");
+}
+
+#[test]
+fn pacing_stays_inert_when_polls_outrun_half_the_window() {
+    let mut pair = Pair::new();
+    pair.client.set_pacing(Duration::from_millis(10));
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+    let before = pair.client.stats().datagrams_sent;
+
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    for index in 0..3 {
+        pair.client.send(
+            conn,
+            Delivery::Unreliable,
+            format!("inert{index}").as_bytes(),
+        );
+        pair.step();
+        sleep(Duration::from_millis(16));
+        for (event, payload) in pair.server_events.drain(..) {
+            if let TransportEvent::Received(_) = event {
+                seen.push(payload);
+            }
+        }
+    }
+
+    let deadline = started + Duration::from_millis(400);
+    while seen.len() < 3 && Instant::now() < deadline {
+        pair.step();
+        for (event, payload) in pair.server_events.drain(..) {
+            if let TransportEvent::Received(_) = event {
+                seen.push(payload);
+            }
+        }
+    }
+
+    assert_eq!(seen.len(), 3, "messages lost at inert pacing: {seen:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "slow polls must flush every pump instead of holding, took {:?}",
+        started.elapsed()
+    );
+    let delta = pair.client.stats().datagrams_sent - before;
+    assert_eq!(delta, 3, "slow polls must not batch into shared datagrams");
+}
+
+#[test]
+fn disconnect_releases_a_held_datagram_before_the_bye() {
+    let mut pair = Pair::new();
+    pair.client.set_pacing(Duration::from_millis(300));
+    pair.connect();
+    assert!(pair.established());
+    let conn = pair.client_conn.unwrap();
+
+    pair.client.send(conn, Delivery::Unreliable, b"lastwords");
+    pair.step();
+    pair.client.disconnect(conn, "soak over");
+
+    let mut payload_seen = false;
+    let mut disconnected = false;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline && !(payload_seen && disconnected) {
+        pair.step();
+        for (event, payload) in pair.server_events.drain(..) {
+            match event {
+                TransportEvent::Received(_) => {
+                    assert_eq!(payload.as_slice(), b"lastwords".as_slice());
+                    payload_seen = true;
+                }
+                TransportEvent::Disconnected(..) => disconnected = true,
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        payload_seen,
+        "the held frame never made it out before the bye"
+    );
+    assert!(disconnected, "the disconnect never propagated");
+}

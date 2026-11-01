@@ -291,6 +291,7 @@ namespace Robust.Shared.Network
             _config.OnValueChanged(CVars.NetMtuExpand, MtuExpandChanged);
             _config.OnValueChanged(CVars.NetMtuExpandFrequency, MtuExpandFrequencyChanged);
             _config.OnValueChanged(CVars.NetMtuExpandFailAttempts, MtuExpandFailAttemptsChanged);
+            _config.OnValueChanged(CVars.NetPacing, PacingChanged);
 
             _config.OnValueChanged(CVars.NetVerbose, NetVerboseChanged);
             _config.OnValueChanged(CVars.NetLogging, NetLoggingChanged);
@@ -412,6 +413,11 @@ namespace Robust.Shared.Network
             ApplyTransportSettings();
         }
 
+        private void PacingChanged(int milliseconds)
+        {
+            ApplyTransportSettings();
+        }
+
         private NetTransportSettings BuildTransportSettings()
         {
             return new NetTransportSettings
@@ -421,6 +427,7 @@ namespace Robust.Shared.Network
                 MtuExpand = _config.GetCVar(CVars.NetMtuExpand),
                 MtuExpandFrequency = _config.GetCVar(CVars.NetMtuExpandFrequency),
                 MtuExpandFailAttempts = _config.GetCVar(CVars.NetMtuExpandFailAttempts),
+                PacingMilliseconds = _config.GetCVar(CVars.NetPacing),
                 PingInterval = 1f,
                 ConnectionTimeout = _config.GetCVar(CVars.NetConnectionTimeout),
                 MaxIpConnections = _config.GetCVar(CVars.NetMaxIpConnections),
@@ -660,6 +667,7 @@ namespace Robust.Shared.Network
             _config.UnsubValueChanged(CVars.NetMtuExpand, MtuExpandChanged);
             _config.UnsubValueChanged(CVars.NetMtuExpandFrequency, MtuExpandFrequencyChanged);
             _config.UnsubValueChanged(CVars.NetMtuExpandFailAttempts, MtuExpandFailAttemptsChanged);
+            _config.UnsubValueChanged(CVars.NetPacing, PacingChanged);
 
             _serializer.ClientHandshakeComplete -= OnSerializerOnClientHandshakeComplete;
 

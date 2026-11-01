@@ -52,6 +52,7 @@ internal struct NetTransportSettings
     public bool MtuExpand;
     public float MtuExpandFrequency;
     public int MtuExpandFailAttempts;
+    public int PacingMilliseconds;
     public float PingInterval;
     public float ConnectionTimeout;
     public int MaxIpConnections;

@@ -332,6 +332,23 @@ pub unsafe extern "C" fn sg_transport_set_mtu_expand(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sg_transport_set_pacing(
+    transport: *mut UdpTransport,
+    window_ms: u32,
+) -> u32 {
+    if transport.is_null() {
+        return 0;
+    }
+    let window = if window_ms == 0 {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(u64::from(window_ms.max(1)))
+    };
+    unsafe { (*transport).set_pacing(window) };
+    1
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sg_transport_connection_mtu(
     transport: *const UdpTransport,
     connection: u64,

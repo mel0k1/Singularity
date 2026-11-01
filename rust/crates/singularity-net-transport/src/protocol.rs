@@ -49,6 +49,7 @@ pub struct TransportConfig {
     pub expand_mtu: bool,
     pub expand_mtu_frequency: Duration,
     pub expand_mtu_fail_attempts: u32,
+    pub pacing: Duration,
 }
 
 impl Default for TransportConfig {
@@ -66,6 +67,7 @@ impl Default for TransportConfig {
             expand_mtu: false,
             expand_mtu_frequency: DEFAULT_EXPAND_MTU_FREQUENCY,
             expand_mtu_fail_attempts: DEFAULT_EXPAND_MTU_FAIL_ATTEMPTS,
+            pacing: Duration::ZERO,
         }
     }
 }
@@ -83,6 +85,7 @@ pub struct FrameOut {
     mtu: usize,
     current: Vec<u8>,
     ready: Vec<Vec<u8>>,
+    standalone_tail: bool,
 }
 
 impl FrameOut {
@@ -91,6 +94,7 @@ impl FrameOut {
             mtu,
             current: Vec::with_capacity(mtu),
             ready: Vec::new(),
+            standalone_tail: false,
         }
     }
 
@@ -106,6 +110,7 @@ impl FrameOut {
         frag: Option<&FragmentHeader>,
         payload: &[u8],
     ) {
+        self.standalone_tail = false;
         let frag_bytes = frag
             .map(|meta| {
                 let total_bytes = bytes_to_hold_bits(meta.total_bits);
@@ -143,9 +148,25 @@ impl FrameOut {
         self.flush();
         self.push_message(kind, 0, None, payload);
         self.flush();
+        self.standalone_tail = true;
+    }
+
+    pub fn standalone_tail(&self) -> bool {
+        self.standalone_tail
+    }
+
+    pub fn adopt(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() || bytes.len() > self.mtu {
+            return;
+        }
+        if !self.current.is_empty() {
+            self.flush();
+        }
+        self.current = bytes;
     }
 
     pub fn push_acks(&mut self, acks: &mut VecDeque<(u8, u16)>) {
+        self.standalone_tail = false;
         while !acks.is_empty() {
             let room = self.mtu.saturating_sub(self.current.len() + HEADER_BYTES) / 3;
             if room == 0 {
@@ -378,6 +399,10 @@ impl Protocol {
 
     pub fn is_dead(&self) -> bool {
         self.status == Status::Dead
+    }
+
+    pub fn status(&self) -> Status {
+        self.status
     }
 
     pub fn reason(&self) -> Option<&str> {
